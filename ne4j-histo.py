@@ -471,12 +471,13 @@ class Neo4jClient:
                 """, {"estructura": estructura, "tincion": tincion})
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
-                             pagina: int, ocr_text: str, 
+                             pagina: int, ocr_text: str, texto_pagina: str,
                              emb_uni: List[float], emb_plip: List[float]):
         await self.run("""
             MERGE (i:Imagen {id: $id})
             SET i.path = $path, i.fuente = $fuente,
                 i.pagina = $pagina, i.ocr_text = $ocr_text,
+                i.texto_pagina = $texto_pagina,
                 i.embedding_uni = $emb_uni,
                 i.embedding_plip = $emb_plip
             WITH i
@@ -486,7 +487,7 @@ class Neo4jClient:
             MERGE (i)-[:EN_PAGINA]->(pag)
         """, {
             "id": imagen_id, "path": path, "fuente": fuente,
-            "pagina": pagina, "ocr_text": ocr_text, 
+            "pagina": pagina, "ocr_text": ocr_text, "texto_pagina": texto_pagina,
             "emb_uni": emb_uni, "emb_plip": emb_plip
         })
 
@@ -531,7 +532,9 @@ class Neo4jClient:
              query = """
                 CALL db.index.vector.queryNodes($index, $k, $emb)
                 YIELD node AS i, score
-                RETURN i.id AS id, i.ocr_text AS texto, i.fuente AS fuente,
+                RETURN i.id AS id, 
+                       coalesce(i.texto_pagina, i.ocr_text) AS texto, 
+                       i.fuente AS fuente,
                        'imagen' AS tipo, i.path AS imagen_path, score AS similitud
                 ORDER BY similitud DESC
             """
@@ -619,12 +622,20 @@ class Neo4jClient:
 
             RETURN DISTINCT
                 v.id AS id,
-                CASE WHEN v:Imagen THEN coalesce(v.ocr_text, '') ELSE coalesce(v.texto, '') END AS texto,
+                CASE 
+                    WHEN v:Imagen THEN coalesce(v.texto_pagina, v.ocr_text, '') 
+                    ELSE coalesce(v.texto, '') 
+                END AS texto,
                 v.fuente AS fuente,
                 CASE WHEN v:Imagen THEN 'imagen' ELSE 'texto' END AS tipo,
                 CASE WHEN v:Imagen THEN v.path ELSE null END AS imagen_path,
-                0.3 AS similitud
-            LIMIT 10
+                CASE 
+                    WHEN (n:Imagen AND v:Imagen AND n.pagina = v.pagina) OR
+                         (n:Chunk AND v:Imagen AND n.fuente = v.fuente) // Aproximación si no hay pág en chunk
+                    THEN 0.95 
+                    ELSE 0.3 
+                END AS similitud
+            LIMIT 15
         """
         try:
             return await self.run(query, {"ids": node_ids})
@@ -1086,9 +1097,16 @@ class ExtractorImagenesPDF:
                     except Exception:
                         ocr_text = ""
                     
+                    # CAPTURAR TEXTO DE LA PÁGINA (Mejora Antigravity)
+                    try:
+                        texto_completo_pagina = pagina.get_text().strip()
+                    except Exception:
+                        texto_completo_pagina = ""
+
                     imagenes_extraidas.append({
                         "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
-                        "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text
+                        "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
+                        "texto_pagina": texto_completo_pagina
                     })
                 except Exception as e:
                     print(f"  ⚠️ Error guardando pág {num_pagina}: {e}")
@@ -1107,10 +1125,17 @@ class ExtractorImagenesPDF:
                             ocr_text = pytesseract.image_to_string(pil_full).strip()[:300]
                         except Exception:
                             ocr_text = ""
+
+                        # CAPTURAR TEXTO DE LA PÁGINA (Mejora Antigravity)
+                        try:
+                            texto_completo_pagina = pagina.get_text().strip()
+                        except Exception:
+                            texto_completo_pagina = ""
                         
                         imagenes_extraidas.append({
                             "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
-                            "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text
+                            "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
+                            "texto_pagina": texto_completo_pagina
                         })
                 except Exception as e:
                     print(f"  ⚠️ Fallback error pág {num_pagina}: {e}")
@@ -2070,6 +2095,7 @@ class AsistenteHistologiaNeo4j:
                     imagen_id=img_id, path=img_path,
                     fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
                     ocr_text=img_info.get("ocr_text", ""),
+                    texto_pagina=img_info.get("texto_pagina", ""),
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist()
                 )
@@ -2091,7 +2117,7 @@ class AsistenteHistologiaNeo4j:
                 emb_p = self.plip.embed_image(img_path)
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
-                    pagina=0, ocr_text=ocr[:300], emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
+                    pagina=0, ocr_text=ocr[:300], texto_pagina="", emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()
                 )
             except Exception as e:
                 print(f"  ❌ Imagen extra {img_path}: {e}")

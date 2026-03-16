@@ -1,125 +1,71 @@
-# RAG Histología Neo4j — Fullstack Edition
+# RAG Histología Multimodal v4.1 (Neo4j + LangGraph)
 
-Sistema RAG (Retrieval-Augmented Generation) multimodal especializado en histología, que combina búsqueda vectorial y teoría de grafos (GraphRAG) para responder consultas complejas sobre tejidos, tinciones y morfología celular.
+Este proyecto implementa un sistema de Generación Aumentada por Recuperación (RAG) multimodal especializado en histología. Utiliza una arquitectura avanzada basada en grafos para la orquestación del flujo de trabajo y una base de datos de grafos para el almacenamiento y recuperación de conocimiento complejo.
 
-Esta versión **Fullstack** expone el motor RAG original (`ne4j-histo.py`) a través de una API moderna (FastAPI) y una interfaz de chat web (A2UI) con soporte para imágenes y renderizado enriquecido.
+## 🚀 Características Principales
+
+*   **Arquitectura LangGraph**: Flujo de trabajo orquestado mediante grafos de estado para un control preciso de la lógica de razonamiento.
+*   **Recuperación Híbrida**: Combina búsqueda semántica por texto (HuggingFace), búsqueda visual (modelos especializados UNI y PLIP), y búsqueda por entidades en grafo (Neo4j).
+*   **Memoria Semántica Persistente**: Utiliza Qdrant para mantener un historial de conversación y contexto visual (imágenes) entre turnos.
+*   **Modelos de SOTA**:
+    *   **LLM**: Groq (Llama 4) para razonamiento ultrarrápido.
+    *   **Embeddings de Imagen**: **UNI** (Mahmood Lab) y **PLIP** para representaciones histológicas precisas.
+    *   **Embeddings de Texto**: `all-MiniLM-L6-v2` (Sentence-Transformers).
+*   **Detección de Hardware**: Fallback automático a CPU si la GPU es incompatible (CUDA capability < 7.0).
 
 ## 🏗️ Arquitectura del Sistema
 
-El sistema sigue una arquitectura cliente-servidor desacoplada, donde el backend wrappea el motor de IA existente sin modificar su núcleo.
-
 ```mermaid
 graph TD
-    subgraph "Frontend (Cliente Web)"
-        UI["index.html"]
-        JS["app.js"]
-        CSS["style.css"]
-        A2UI["Panel A2UI"]
+    User([Usuario]) --> START
+    subgraph LangGraph_Workflow
+        START --> init[Inicializar Estado]
+        init --> img_proc[Procesar Imagen / Memoria]
+        img_proc --> classify[Clasificar Dominio Semántico]
+        classify -- En Temario --> gen_query[Generar Consulta Híbrida]
+        classify -- Fuera de Temario --> out_scope[Nodo Fuera de Temario]
+        gen_query --> search[Búsqueda Neo4j: Txt + UNI + PLIP + Entidades]
+        search --> filter[Filtrar y Rerank de Contexto]
+        filter --> compare[Análisis Comparativo Visual]
+        compare --> generate[Generar Respuesta Final]
+        generate --> FIN
+        out_scope --> FIN
     end
-
-    subgraph "Backend (Servidor)"
-        API["FastAPI Server (server.py)"]
-        RAG["Motor RAG (ne4j-histo.py)"]
-        LG["LangGraph State Machine"]
+    
+    subgraph Storage
+        search --- Neo4j[(Neo4j Graph)]
+        img_proc --- Qdrant[(Qdrant Memory)]
     end
-
-    subgraph "Persistencia & IA"
-        N4J[("Neo4j Graph DB")]
-        PDF["PDF Documents"]
-        GEM["Gemini 1.5 Pro"]
-        EMB["PLIP / UNI Embeddings"]
-    end
-
-    %% Flujo
-    UI -- "1. POST /api/chat (Texto + Img)" --> API
-    API -- "2. Invoca" --> RAG
-    RAG -- "3. Ejecuta" --> LG
-    LG -- "4. Consulta Híbrida" --> N4J
-    LG -- "5. Genera Embeddings" --> EMB
-    LG -- "6. Genera Respuesta" --> GEM
-    RAG -- "Devuelve Respuesta + Metadata" --> API
-    API -- "JSON Response" --> JS
-    JS -- "Renderiza Markdown/A2UI" --> UI
 ```
 
----
+## 📊 Esquema de Grafo (Neo4j)
 
-## 💻 Frontend (Cliente)
+El sistema organiza el conocimiento en los siguientes nodos y relaciones:
 
-El cliente es una SPA (Single Page Application) ligera construida con Vanilla JS, HTML5 y CSS3 moderno (Glassmorphism). No requiere frameworks complejos ni compilación.
+*   **Nodos**: `PDF`, `Chunk`, `Imagen`, `Tejido`, `Estructura`, `Tincion`, `Pagina`.
+*   **Relaciones**:
+    *   `(Chunk)-[:PERTENECE_A]->(PDF)`: Trazabilidad de origen.
+    *   `(Chunk)-[:MENCIONA]->(Tejido|Estructura|Tincion)`: Vinculación semántica.
+    *   `(Tejido)-[:CONTIENE]->(Estructura)`: Jerarquía anatómica.
+    *   `(Tejido|Estructura)-[:TENIDA_CON]->(Tincion)`: Conocimiento de técnicas.
+    *   `(Imagen)-[:SIMILAR_A]->(Imagen)`: Relaciones visuales por embedding UNI.
 
-### Componentes Principales
+## 🛠️ Requisitos e Instalación
 
-1.  **`index.html`**:
-    *   Estructura semántica de la aplicación.
-    *   Contiene el área de chat, barra de entrada (sticky), paneles laterales (Temario, A2UI) y pantalla de bienvenida.
-    *   Usa clases utilitarias para el layout y la tipografía.
+1.  **Dependencias**: El proyecto utiliza `uv` para la gestión de paquetes.
+    ```bash
+    uv sync
+    ```
+2.  **Configuración**: Copia el archivo `.env.example` a `.env` y completa tus credenciales.
+    *   `GROQ_API_KEY`: Para el razonamiento del LLM.
+    *   `HF_TOKEN`: (Read) Para descargar los modelos UNI y PLIP.
+    *   `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`: Credenciales de tu base de datos Neo4j (AuraDB recomendada).
 
-2.  **`style.css`**:
-    *   **Tema:** Dark mode premium con paleta violeta/cyan (`#7c3aed`, `#06b6d4`).
-    *   **Efectos:** Glassmorphism (fondos translúcidos con `backdrop-filter: blur`), sombras suaves, y micro-animaciones (fade-in, slide-up).
-    *   **Responsividad:** Diseño fluido que se adapta a escritorio y móvil.
+## 🖥️ Ejecución
 
-3.  **`app.js`**:
-    *   **Gestión de Estado:** Maneja la imagen activa en base64, el historial de chat y el estado de carga.
-    *   **Comunicación API:**
-        *   Envía peticiones paralelas a `/api/chat` (para texto) y `/api/chat/a2ui` (para JSON estructurado).
-        *   Maneja errores y estados de "escribiendo..." (typing indicator).
-    *   **Renderizado Markdown:** Convierte la respuesta del LLM (con tablas, listas, código) a HTML seguro.
-    *   **Protocolo A2UI:** Visualiza la respuesta en formato JSON crudo para depuración o integración con otros agentes A2A.
-
----
-
-## ⚙️ Backend (Servidor)
-
-El servidor está construido con **FastAPI** y actúa como un wrapper alrededor del script original `ne4j-histo.py`.
-
-### Archivos Clave
-
-1.  **`server.py`**:
-    *   **Importación Dinámica:** Usa `importlib` para cargar `ne4j-histo.py` como un módulo, permitiendo usar su clase `AsistenteHistologiaNeo4j` sin modificar el código original.
-    *   **Endpoints REST:**
-        *   `POST /api/chat`: Endpoint principal. Recibe `{query, image_base64}`. Guarda la imagen temporalmente, invoca al asistente, y devuelve la respuesta junto con metadatos (trayectoria, estructura identificada).
-        *   `POST /api/chat/a2ui`: Similar al anterior, pero devuelve la respuesta formateada en el protocolo **A2UI** (Abstract Application User Interface), útil para interoperabilidad con agentes de Google.
-        *   `GET /api/temario`: Devuelve la lista de temas extraídos de los PDFs.
-        *   `GET /api/status`: Estado de salud del sistema y del grafo.
-    *   **Archivos Estáticos:** Sirve el frontend (`client/`) en la ruta raíz `/`.
-
-2.  **`ne4j-histo.py` (Core RAG)**:
-    *   **LangGraph:** Orquestador del flujo de razonamiento (Planificar → Buscar → Refinar → Responder).
-    *   **Multimodal:** Integra modelos de visión (PLIP, UNI) para entender imágenes histológicas y buscar similares en la base de datos vectorial.
-    *   **Neo4j:** Almacena el conocimiento en un grafo de conocimiento (Nodos: Texto, Imagen, Entidad).
-
----
-
-## 🚀 Cómo Ejecutar
-
-### Prerrequisitos
-*   Python 3.10+
-*   Neo4j Database (corriendo local o en AuraDB)
-*   Variables de entorno configuradas en `.env` (Google API Key, Neo4j credenciales).
-
-### Opción 1: Desarrollo (con Hot-Reload)
-Recomendado. Usa `uvicorn` para reiniciar el servidor al detectar cambios.
-
+Para iniciar el servidor en modo desarrollo:
 ```bash
 npm run dev
-# O directamente:
-# uv run uvicorn server:app --reload --host 0.0.0.0 --port 10005
 ```
 
-Acceder a: **http://localhost:10005**
-
-### Opción 2: Producción
-Ejecuta el servidor con el intérprete de Python directamente.
-
-```bash
-uv run python server.py
-```
-
-### Opción 3: Modo CLI (Legacy)
-El modo interactivo original por consola sigue funcionando:
-
-```bash
-uv run python ne4j-histo.py --interactivo
-```
+El servidor utiliza FastAPI y Uvicorn, escuchando por defecto en el puerto `10005`.
