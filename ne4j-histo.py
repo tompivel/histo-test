@@ -59,7 +59,7 @@ import fitz # PyMuPDF
 from pdf2image import convert_from_path
 import pytesseract
 
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -83,9 +83,9 @@ nest_asyncio.apply()
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
-SIMILARITY_THRESHOLD  = 0.50
+SIMILARITY_THRESHOLD  = 0.45
 # Dimensiones de embeddings
-DIM_TEXTO_GEMINI = 3072
+DIM_TEXTO        = 384
 DIM_IMG_UNI      = 1024
 DIM_IMG_PLIP     = 512
 
@@ -93,7 +93,7 @@ DIRECTORIO_IMAGENES   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 DIRECTORIO_PDFS       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf")
 
 # Índices Neo4j
-INDEX_TEXTO = "histo_text"      # Gemini Text
+INDEX_TEXTO = "histo_text"      # Text Vector
 INDEX_UNI   = "histo_img_uni"   # UNI Image
 INDEX_PLIP  = "histo_img_plip"  # PLIP Image
 
@@ -356,14 +356,34 @@ class Neo4jClient:
             except Exception as e:
                 print(f"  ⚠️ Constraint: {e}")
 
+        # --- Validación de Índices Vectoriales (Dimensionalidad) ---
+        try:
+            indexes = await self.run("SHOW INDEXES YIELD name, type, options")
+            for idx in indexes:
+                if idx["type"] == "VECTOR":
+                    name = idx["name"]
+                    config = idx["options"].get("indexConfig", {})
+                    dims = config.get("vector.dimensions")
+                    
+                    target_dims = None
+                    if name == INDEX_TEXTO: target_dims = DIM_TEXTO
+                    elif name == INDEX_UNI: target_dims = DIM_IMG_UNI
+                    elif name == INDEX_PLIP: target_dims = DIM_IMG_PLIP
+                    
+                    if target_dims and dims != target_dims:
+                        print(f"  ⚠️ Dimensión incorrecta en índice Neo4j '{name}' ({dims} != {target_dims}). Recreando...")
+                        await self.run(f"DROP INDEX {name}")
+        except Exception as e:
+            print(f"  ⚠️ Error validando índices Neo4j: {e}")
+
         # 3 Índices Vectoriales
         vector_queries = [
-            # 1. TEXTO (Gemini)
+            # 1. TEXTO
             f"""
             CREATE VECTOR INDEX {INDEX_TEXTO} IF NOT EXISTS
             FOR (c:Chunk) ON c.embedding
             OPTIONS {{indexConfig: {{
-                `vector.dimensions`: {DIM_TEXTO_GEMINI},
+                `vector.dimensions`: {DIM_TEXTO},
                 `vector.similarity_function`: 'cosine'
             }}}}
             """,
@@ -553,7 +573,7 @@ class Neo4jClient:
                  collect(DISTINCT ti) AS tinciones
             WHERE {where_str}
             RETURN c.id AS id, c.texto AS texto, c.fuente AS fuente,
-                   'texto' AS tipo, null AS imagen_path, 0.5 AS similitud
+                   'texto' AS tipo, null AS imagen_path, 0.49 AS similitud
             LIMIT $top_k
         """
         params["top_k"] = top_k
@@ -679,11 +699,11 @@ class Neo4jClient:
                     combined[key]["similitud"] += sim_ponderada
 
         # Pesos ajustados
-        agregar(res_texto, 0.40) # Texto sigue siendo fundamental
-        agregar(res_uni,   0.20) # UNI complemento visual
-        agregar(res_plip,  0.20) # PLIP complemento visual
-        agregar(res_ent,   0.35) # Entidades (¡Crucial para discriminar órganos!)
-        agregar(res_vec,   0.10)
+        agregar(res_texto, 0.80) # Texto sigue siendo fundamental
+        agregar(res_uni,   0.50) # UNI complemento visual
+        agregar(res_plip,  0.50) # PLIP complemento visual
+        agregar(res_ent,   0.60) # Entidades (¡Crucial para discriminar órganos!)
+        agregar(res_vec,   0.20)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
@@ -724,15 +744,26 @@ class SemanticMemory:
         self.collection_name = "memoria_histo"
         self.qdrant = QdrantClient(path="./qdrant_memoria")
         
-        # Si la colección no existe, se crea con vectores con nombre
+        # --- Validación de Colección Qdrant (Dimensionalidad) ---
         try:
-            self.qdrant.get_collection(self.collection_name)
+            info = self.qdrant.get_collection(self.collection_name)
+            config = info.config.params.vectors
+            
+            # Verificar dimensión de 'texto'
+            dims_actual = 0
+            if isinstance(config, dict) and "texto" in config:
+                dims_actual = config["texto"].size
+            
+            if dims_actual != DIM_TEXTO:
+                print(f"   ⚠️ Dimensión de Qdrant incorrecta ({dims_actual} != {DIM_TEXTO}). Recreando...")
+                self.qdrant.delete_collection(self.collection_name)
+                raise Exception("Mismatch forcing recreation")
         except Exception:
-            print(f"   🗂️ Creando colección Qdrant '{self.collection_name}' para memoria semántica...")
+            print(f"   🗂️ Configurando colección Qdrant '{self.collection_name}'...")
             self.qdrant.create_collection(
                 collection_name=self.collection_name,
                 vectors_config={
-                    "texto": VectorParams(size=DIM_TEXTO_GEMINI, distance=Distance.COSINE),
+                    "texto": VectorParams(size=DIM_TEXTO, distance=Distance.COSINE),
                     "uni": VectorParams(size=DIM_IMG_UNI, distance=Distance.COSINE),
                     "plip": VectorParams(size=DIM_IMG_PLIP, distance=Distance.COSINE),
                 }
@@ -879,8 +910,9 @@ class ClasificadorSemantico:
       2. Razonamiento LLM con contexto de imagen disponible.
     """
 
-    UMBRAL_SIMILITUD = 0.18
-    UMBRAL_LLM       = 0.5
+    UMBRAL_SIMILITUD = 0.49
+    UMBRAL_LLM       = 0.49
+
 
     def __init__(self, llm, embeddings, device: str, temario: List[str]):
         self.llm       = llm
@@ -965,7 +997,7 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
             ])
             texto     = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
             data      = json.loads(texto)
-            confianza = float(data.get("confianza", 0.5))
+            confianza = float(data.get("confianza", 0.49))
             valido    = bool(data.get("valido", True))
 
             if not valido and imagen_activa and confianza < 0.7:
@@ -977,7 +1009,7 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
                 "tema_encontrado":   data.get("tema_encontrado"),
                 "motivo":            data.get("motivo", ""),
                 "similitud_dominio": sim,
-                "metodo":            "llm" if sim < umbral_efectivo * 0.5 else "combinado"
+                "metodo":            "llm" if sim < umbral_efectivo * 0.49 else "combinado"
             }
         except Exception as e:
             print(f"   ⚠️ Error clasificador LLM: {e}")
@@ -995,39 +1027,97 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
 # =============================================================================
 
 class ExtractorImagenesPDF:
-    RENDER_DPI = 150
+    MIN_WIDTH  = 200
+    MIN_HEIGHT = 200
 
     def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES):
         self.directorio_salida = directorio_salida
         os.makedirs(directorio_salida, exist_ok=True)
 
     def extraer_de_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
-        imagenes   = []
+        imagenes_extraidas = []
         nombre_pdf = os.path.splitext(os.path.basename(pdf_path))[0]
         try:
-            paginas = convert_from_path(pdf_path, dpi=self.RENDER_DPI)
+            doc = fitz.open(pdf_path)
         except Exception as e:
-            print(f"❌ Error renderizando {pdf_path}: {e}")
+            print(f"❌ Error abriendo {pdf_path}: {e}")
             return []
 
-        for num_pagina, pil_img in enumerate(paginas, start=1):
-            nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.png"
-            ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+        for num_pagina, pagina in enumerate(doc, start=1):
+            valid_images_this_page = []
+            
+            # Método preciso: solo imágenes realmente dibujadas en esta página
             try:
-                pil_img.save(ruta_completa, format="PNG")
+                img_info_list = pagina.get_image_info(xrefs=True)
+                page_xrefs = [info["xref"] for info in img_info_list if info.get("xref")]
+                
+                if page_xrefs:
+                    for xref in page_xrefs:
+                        try:
+                            base_image = doc.extract_image(xref)
+                            if not base_image: continue
+                            
+                            image_bytes = base_image["image"]
+                            from io import BytesIO
+                            pil_temp = Image.open(BytesIO(image_bytes))
+                            w, h = pil_temp.size
+                            
+                            if w >= self.MIN_WIDTH and h >= self.MIN_HEIGHT:
+                                valid_images_this_page.append({
+                                    "pil": pil_temp,
+                                    "area": w * h
+                                })
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            
+            if valid_images_this_page:
+                # Seleccionar la imagen más grande (histológica)
+                mejor = max(valid_images_this_page, key=lambda x: x["area"])
+                pil_img = mejor["pil"]
+                nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.png"
+                ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+                
                 try:
-                    ocr_text = pytesseract.image_to_string(pil_img).strip()[:300]
-                except Exception:
-                    ocr_text = ""
-                imagenes.append({
-                    "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
-                    "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text
-                })
-            except Exception as e:
-                print(f"  ⚠️ Error pág {num_pagina}: {e}")
+                    pil_img.save(ruta_completa, format="PNG")
+                    try:
+                        ocr_text = pytesseract.image_to_string(pil_img).strip()[:300]
+                    except Exception:
+                        ocr_text = ""
+                    
+                    imagenes_extraidas.append({
+                        "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
+                        "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text
+                    })
+                except Exception as e:
+                    print(f"  ⚠️ Error guardando pág {num_pagina}: {e}")
+            else:
+                # FALLBACK: No hay imágenes o son muy chicas -> Renderizar página completa
+                try:
+                    from pdf2image import convert_from_path
+                    pag_imgs = convert_from_path(pdf_path, first_page=num_pagina, last_page=num_pagina, dpi=150)
+                    if pag_imgs:
+                        pil_full = pag_imgs[0]
+                        nombre_archivo = f"{nombre_pdf}_pag{num_pagina}_full.png"
+                        ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+                        pil_full.save(ruta_completa, format="PNG")
+                        
+                        try:
+                            ocr_text = pytesseract.image_to_string(pil_full).strip()[:300]
+                        except Exception:
+                            ocr_text = ""
+                        
+                        imagenes_extraidas.append({
+                            "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
+                            "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text
+                        })
+                except Exception as e:
+                    print(f"  ⚠️ Fallback error pág {num_pagina}: {e}")
 
-        print(f"  📸 {len(imagenes)} páginas de {os.path.basename(pdf_path)}")
-        return imagenes
+        doc.close()
+        print(f"  📸 {len(imagenes_extraidas)} imágenes procesadas de {os.path.basename(pdf_path)}")
+        return imagenes_extraidas
 
     def extraer_de_directorio(self, directorio: str) -> List[Dict[str, str]]:
         todas = []
@@ -1185,8 +1275,8 @@ class AsistenteHistologiaNeo4j:
 
         self.uni   = None
         self.plip  = None
-        self.embeddings = None  # Google Embeddings
-        self.embed_dim = DIM_TEXTO_GEMINI
+        self.embeddings = None
+        self.embed_dim = DIM_TEXTO
 
         self.neo4j: Optional[Neo4jClient] = None
 
@@ -1252,13 +1342,12 @@ class AsistenteHistologiaNeo4j:
         )
         print("✅ Groq inicializado")
         
-        # Inicializar Embeddings (Gemini)
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001",
-            google_api_key=userdata.get("GOOGLE_API_KEY"),
-            max_retries=1
+        # Inicializar Embeddings (HuggingFace)
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': self.device}
         )
-        print("✅ Embeddings Gemini inicializados")
+        print("✅ Embeddings HuggingFace inicializados")
 
         # Cargar Modelos (UNI + PLIP)
         self.plip = PlipWrapper(self.device)
@@ -1476,7 +1565,7 @@ class AsistenteHistologiaNeo4j:
 
         # ── Embedding del texto de consulta (Gemini) ───────────────────
         try:
-            emb_texto = self._embed_texto_gemini(state["consulta_texto"])
+            emb_texto = self._embed_texto(state["consulta_texto"])
             state["texto_embedding"] = emb_texto
         except Exception as e:
             print(f"⚠️ Error embedding texto: {e}")
@@ -1746,23 +1835,14 @@ class AsistenteHistologiaNeo4j:
         t0 = time.time()
         print("💭 Generando respuesta v4.1...")
 
-        aviso_db = ""
         if not state["contexto_suficiente"]:
-            # Sin contexto RAG pero hay imagen → permitimos que el LLM responda guiándose por la imagen y la memoria
-            if state.get("tiene_imagen") and state.get("imagen_path"):
-                print("   ⚠️ Sin contexto RAG pero hay imagen — permitiendo chat con imagen")
-                aviso_db = "\n\nAVISO PARA EL ASISTENTE: No se encontraron resultados en la base de datos para esta consulta. DEBES informar explícitamente al usuario que no encontraste información referenciada en el manual, pero responde a su pregunta basándote en la imagen subida y el historial de chat."
-                state["contexto_suficiente"] = True
-            else:
-                state["respuesta_final"] = (
-                    f"❌ Sin información suficiente (umbral {self.SIMILARITY_THRESHOLD:.0%}).\n"
-                    f"Consulta: {state['consulta_busqueda_texto']}"
-                )
-                state["trayectoria"].append({
-                    "nodo": "GenerarRespuesta", "contexto_suficiente": False,
-                    "tiempo": round(time.time()-t0, 2)
-                })
-                return state
+            print("   ⚠️ Sin contexto RAG — aplicando rechazo estricto")
+            state["respuesta_final"] = "**Esta información no se encuentra en la base de datos.**"
+            state["trayectoria"].append({
+                "nodo": "GenerarRespuesta", "contexto_suficiente": False,
+                "tiempo": round(time.time()-t0, 2)
+            })
+            return state
 
         tiene_comparativo = bool(_safe(state.get("analisis_comparativo")))
         nota_comp = (
@@ -1775,13 +1855,14 @@ class AsistenteHistologiaNeo4j:
             "REGLAS:\n"
             "1. Solo información de SECCIONES DEL MANUAL e IMÁGENES DE REFERENCIA guardadas en la base de datos, o la propia imagen que subió el usuario.\n"
             "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
-            "3. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+            "3. REGLA DE ORO: Para cada 'IMAGEN DE REFERENCIA' recuperada, DEBES indicar el nombre del archivo (ej: img_cerebro_1.png) y explicar a qué estructura o tejido corresponde según el texto del manual que la acompaña en el contexto.\n"
+            "4. No diagnósticos clínicos salvo que estén explícitos.\n\n"
             "ESTRUCTURA:\n"
             "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
             "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si concluye que la imagen del usuario NO ES LA MISMA ESTRUCTURA que las imágenes de referencia del manual, debes informar al usuario: 'Tu imagen parece ser X, pero el manual solo contiene información sobre Y, por lo que no puedo ayudarte con el manual.' y DETENTE AHÍ.\n"
             "3. Características histológicas según la base de datos (SOLO si las estructuras coinciden)\n"
             "4. Conclusión y confianza"
-            f"{nota_comp}{aviso_db}"
+            f"{nota_comp}"
         )
 
         analisis_comp_str   = _safe(state.get("analisis_comparativo"))
@@ -1895,7 +1976,7 @@ class AsistenteHistologiaNeo4j:
     # Embeddings (Gemini Text)
     # ------------------------------------------------------------------
 
-    def _embed_texto_gemini(self, texto: str) -> List[float]:
+    def _embed_texto(self, texto: str) -> List[float]:
         # Usa langchain GoogleGenerativeAIEmbeddings
         return embed_query_con_reintento(self.embeddings, texto)
 
@@ -1963,7 +2044,7 @@ class AsistenteHistologiaNeo4j:
             print(f"  {fuente}: {len(chunks)} chunks")
             for i, chunk in enumerate(chunks):
                 try:
-                    emb       = self._embed_texto_gemini(chunk)
+                    emb       = self._embed_texto(chunk)
                     chunk_id  = f"chunk_{fuente}_{i}"
                     entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
                     await self.neo4j.upsert_chunk(
