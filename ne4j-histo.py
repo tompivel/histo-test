@@ -610,14 +610,14 @@ class Neo4jClient:
 
             // Expansión 4: imágenes de la misma página que el chunk
             OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf2:PDF)<-[:PERTENECE_A]-(img_pag:Imagen)
-            WITH nid, list_pdf, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
+            WITH n, nid, list_pdf, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
 
-            WITH $ids AS ids_originales,
+            WITH n, $ids AS ids_originales,
                  list_pdf + list_ent + list_sim + list_pag AS vecinos_raw
 
             UNWIND vecinos_raw AS v
 
-            WITH v, ids_originales
+            WITH n, v, ids_originales
             WHERE v IS NOT NULL AND NOT v.id IN ids_originales
 
             RETURN DISTINCT
@@ -631,7 +631,7 @@ class Neo4jClient:
                 CASE WHEN v:Imagen THEN v.path ELSE null END AS imagen_path,
                 CASE 
                     WHEN (n:Imagen AND v:Imagen AND n.pagina = v.pagina) OR
-                         (n:Chunk AND v:Imagen AND n.fuente = v.fuente) // Aproximación si no hay pág en chunk
+                         (n:Chunk AND v:Imagen AND n.fuente = v.fuente)
                     THEN 0.95 
                     ELSE 0.3 
                 END AS similitud
@@ -1054,7 +1054,25 @@ class ExtractorImagenesPDF:
             print(f"❌ Error abriendo {pdf_path}: {e}")
             return []
 
+        def _texto_pagina_con_contexto(doc, idx_0based: int) -> str:
+            """Devuelve texto de la página actual + página siguiente (si existe).
+            Esto evita que la imagen de pág N pierda el contexto/caption de pág N+1."""
+            partes = []
+            try:
+                partes.append(doc[idx_0based].get_text().strip())
+            except Exception:
+                pass
+            if idx_0based + 1 < len(doc):
+                try:
+                    siguiente = doc[idx_0based + 1].get_text().strip()
+                    if siguiente:
+                        partes.append(siguiente)
+                except Exception:
+                    pass
+            return "\n".join(partes)
+
         for num_pagina, pagina in enumerate(doc, start=1):
+            idx_0 = num_pagina - 1  # índice base-0 para acceder a doc[idx]
             valid_images_this_page = []
             
             # Método preciso: solo imágenes realmente dibujadas en esta página
@@ -1097,11 +1115,7 @@ class ExtractorImagenesPDF:
                     except Exception:
                         ocr_text = ""
                     
-                    # CAPTURAR TEXTO DE LA PÁGINA (Mejora Antigravity)
-                    try:
-                        texto_completo_pagina = pagina.get_text().strip()
-                    except Exception:
-                        texto_completo_pagina = ""
+                    texto_completo_pagina = _texto_pagina_con_contexto(doc, idx_0)
 
                     imagenes_extraidas.append({
                         "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
@@ -1126,11 +1140,7 @@ class ExtractorImagenesPDF:
                         except Exception:
                             ocr_text = ""
 
-                        # CAPTURAR TEXTO DE LA PÁGINA (Mejora Antigravity)
-                        try:
-                            texto_completo_pagina = pagina.get_text().strip()
-                        except Exception:
-                            texto_completo_pagina = ""
+                        texto_completo_pagina = _texto_pagina_con_contexto(doc, idx_0)
                         
                         imagenes_extraidas.append({
                             "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
