@@ -115,8 +115,8 @@ class IngestionPipeline:
                     chunk_id  = f"chunk_{source}_{i}"
                     entities  = self.entity_extractor.extract_from_text_sync(chunk)
                     await self.db.upsert_chunk(
-                        chunk_id=chunk_id, texto=chunk, fuente=source,
-                        chunk_idx=i, embedding=emb, entidades=entities
+                        chunk_id=chunk_id, text=chunk, source=source,
+                        chunk_idx=i, embedding=emb, entities=entities
                     )
                 except Exception as e:
                     print(f"  ⚠️ Chunk {i}: {e}")
