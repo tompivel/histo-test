@@ -112,11 +112,18 @@ class SemanticMemory:
             return ""
             
         vector = self.embeddings.embed_query(current_query)
-        results = self.qdrant.search(
-            collection_name=self.collection_name,
-            query_vector=vector,
-            limit=top_k
-        )
+        if hasattr(self.qdrant, "query_points"):
+            results = self.qdrant.query_points(
+                collection_name=self.collection_name,
+                query=vector,
+                limit=top_k
+            ).points
+        else:
+            results = self.qdrant.search(
+                collection_name=self.collection_name,
+                query_vector=vector,
+                limit=top_k
+            )
         
         if not results:
             return ""
