@@ -15,8 +15,8 @@ except ImportError:
         En entornos locales, intercepta las llamadas y extrae de os.environ (.env).
         """
         @staticmethod
-        def get(key, default=None):
-            return os.environ.get(key, default)
+        def get(key):
+            return os.environ.get(key)
 
 # Cargar variables de entorno desde .env (Solo afecta en Local)
 load_dotenv()
