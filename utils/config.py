@@ -1,11 +1,28 @@
 import os
 from dotenv import load_dotenv
 
-# Cargar variables de entorno desde .env
+# =============================================================================
+# GESTIÓN HÍBRIDA DE SECRETOS (LOCAL vs COLAB)
+# =============================================================================
+try:
+    from google.colab import userdata
+    COLAB_ENV = True
+except ImportError:
+    COLAB_ENV = False
+    class userdata:
+        """
+        Clase de conveniencia emulando el comportamiento de google.colab.userdata.
+        En entornos locales, intercepta las llamadas y extrae de os.environ (.env).
+        """
+        @staticmethod
+        def get(key, default=None):
+            return os.environ.get(key, default)
+
+# Cargar variables de entorno desde .env (Solo afecta en Local)
 load_dotenv()
 
 # Verificar HF_TOKEN
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = userdata.get("HF_TOKEN")
 if HF_TOKEN:
     try:
         from huggingface_hub import login
@@ -14,27 +31,7 @@ if HF_TOKEN:
     except Exception as e:
         print(f"⚠️ Error login HF: {e}")
 else:
-    print("⚠️ HF_TOKEN no encontrado en .env (necesario para UNI)")
-
-# Wrapper para leer variables de entorno (compatible con .env)
-class userdata:
-    """
-    Clase de conveniencia para emular el diccionario userdata utilizado comúnmente 
-    en entornos de Google Colab para almacenar secretos fijos.
-    En local, busca las variables estáticas desde las variables de ambiente nativas (`os.environ`).
-    """
-    @staticmethod
-    def get(key):
-        """
-        Recupera un valor de seguridad del entorno o ambiente activo.
-
-        Args:
-            key (str): Clave secreta solicitada.
-
-        Returns:
-            str: Valor desempaquetado si existe, None en caso contrario.
-        """
-        return os.environ.get(key)
+    print("⚠️ HF_TOKEN no encontrado (necesario para descargar UNI/PLIP)")
 
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
