@@ -78,9 +78,13 @@ class PipelineIngestion:
             try:
                 res = await self.db.run("MATCH (c:Chunk) RETURN count(c) AS n")
                 if res and res[0]["n"] > 0:
-                    print("✅ Base de datos Neo4j ya poblada. Saltando indexación. (Usa forzar=True)")
+                    n_chunks = res[0]["n"]
+                    print(f"✅ Base de datos Neo4j ya poblada (Encontrados {n_chunks} nodos 'Chunk').")
+                    print(f"   ( Conectado a: {self.db.uri} )")
+                    print("   Saltando indexación. (Usa forzar=True)")
                     return
             except Exception as e:
+                print(f"⚠️ Error verificando schema: {e}")
                 pass
 
         await self.extraer_y_preparar_temario(directorio_pdfs)
