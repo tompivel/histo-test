@@ -336,4 +336,4 @@ function formatBytes(bytes) {
 }
 
 // ── Log ─────────────────────────────────────────────────────────────
-console.log('🔬 RAG Histología Neo4j + A2UI client initialized');
+console.log('🔬 RAG Histología Neo4j + A2UI client initialized (v4.4)');

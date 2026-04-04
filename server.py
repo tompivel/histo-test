@@ -1,8 +1,8 @@
 """
-Servidor FastAPI para RAG Histología Neo4j — Fullstack A2UI
+FastAPI Server for Histology Neo4j RAG — Fullstack A2UI (v4.4)
 ============================================================
-Wrappea AsistenteHistologiaNeo4j y expone endpoints REST + A2UI.
-El módulo ne4j-histo.py se importa sin modificación.
+Instantiates the `Neo4jHistologyAgent` from the new modular architecture
+and exposes the chat interface (frontend) and async APIs for the RAG.
 """
 
 import asyncio
@@ -12,49 +12,42 @@ import os
 import sys
 import tempfile
 import uuid
+from PIL import Image
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-load_dotenv()
-
-import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from starlette.responses import FileResponse
 from starlette.staticfiles import StaticFiles
+import uvicorn
 
-# ── Importar el módulo principal ─────────────────────────────────────
-# ne4j-histo.py tiene guión, así que lo importamos con importlib
-import importlib.util
+from dotenv import load_dotenv
 
-_HISTO_PATH = Path(__file__).parent / "ne4j-histo.py"
-spec = importlib.util.spec_from_file_location("ne4j_histo", str(_HISTO_PATH))
-ne4j_histo = importlib.util.module_from_spec(spec)
+# ── Imports from the newly refactored English architecture v4.4 ───────
+from core.agent import Neo4jHistologyAgent
+from utils.config import userdata
 
-# Prevenir que el módulo ejecute su __main__
-_original_argv = sys.argv
-sys.argv = ["ne4j-histo.py"]
-spec.loader.exec_module(ne4j_histo)
-sys.argv = _original_argv
+load_dotenv()
 
-AsistenteHistologiaNeo4j = ne4j_histo.AsistenteHistologiaNeo4j
-DIRECTORIO_PDFS = ne4j_histo.DIRECTORIO_PDFS
-
-# ── Estado global ────────────────────────────────────────────────────
-asistente: Optional[AsistenteHistologiaNeo4j] = None
+# ── Global State ─────────────────────────────────────────────────────
+agent: Optional[Neo4jHistologyAgent] = None
 _init_complete = False
 _init_error: Optional[str] = None
 
+# Visual session state proxy for FastAPI (since Core Agent v4.4 is stateless)
+active_image_state_path: Optional[str] = None
+active_image_state_name: Optional[str] = None
 
-# ── Modelos Pydantic ─────────────────────────────────────────────────
+
+# ── Pydantic Models ──────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     query: str
+    session_id: str = "web_session_alpha"
     image_base64: Optional[str] = None
     image_filename: Optional[str] = None
-
 
 class ChatResponse(BaseModel):
     respuesta: str
@@ -67,45 +60,38 @@ class ChatResponse(BaseModel):
 # ── Lifecycle ────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global asistente, _init_complete, _init_error
-    print("🚀 Iniciando servidor RAG Histología Neo4j + A2UI...")
+    global agent, _init_complete, _init_error
+    print("🚀 Starting Histology Neo4j RAG Server Modular (v4.4)...")
 
     try:
-        asistente = AsistenteHistologiaNeo4j()
-        await asistente.inicializar_componentes()
-
-        print("📚 Leyendo PDFs...")
-        asistente.procesar_contenido_base(DIRECTORIO_PDFS)
-
-        print("📋 Extrayendo temario...")
-        await asistente.extraer_y_preparar_temario()
-        n_temas = len(asistente.extractor_temario.temas) if asistente.extractor_temario else 0
-        print(f"   → {n_temas} temas")
-
-        print("💾 Verificando e indexando base de datos Neo4j (si está vacía)...")
-        await asistente.indexar_en_neo4j(DIRECTORIO_PDFS, forzar=False)
+        neo4j_uri = userdata.get('NEO4J_URI') or "bolt://localhost:7687"
+        neo4j_user = userdata.get('NEO4J_USERNAME') or "neo4j"
+        neo4j_pass = userdata.get('NEO4J_PASSWORD') or "password"
+        
+        agent = Neo4jHistologyAgent(neo4j_uri, neo4j_user, neo4j_pass)
+        print("⚙️ Injecting Models and verifying Neo4j Constraints...")
+        await agent.initialize()
 
         _init_complete = True
-        print("✅ Servidor listo")
+        print("✅ Uvicorn Server Ready.")
     except Exception as e:
         import traceback
         traceback.print_exc()
         _init_error = str(e)
-        print(f"❌ Error inicializando: {e}")
+        print(f"❌ Error initializing: {e}")
 
     yield
 
-    # Shutdown
-    if asistente:
-        await asistente.cerrar()
-    print("👋 Servidor apagado")
+    if agent:
+        await agent.db.close()
+    print("👋 Server Offline")
 
 
-# ── App FastAPI ──────────────────────────────────────────────────────
+# ── FastAPI App ──────────────────────────────────────────────────────
 app = FastAPI(
-    title="RAG Histología Neo4j + A2UI",
-    description="Sistema RAG Multimodal de Histología — Fullstack",
-    version="4.1.0",
+    title="RAG Histología Neo4j + Frontend GUI",
+    description="Sistema RAG Multimodal de Histología — Modular v4.4",
+    version="4.4.0",
     lifespan=lifespan,
 )
 
@@ -117,65 +103,57 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Archivos estáticos del cliente
 CLIENT_DIR = Path(__file__).parent / "client"
-
 
 def _check_ready():
     if not _init_complete:
-        raise HTTPException(503, detail=_init_error or "Sistema inicializándose...")
+        raise HTTPException(503, detail=_init_error or "System Initializing... please wait")
 
-
-# ── Rutas de archivos del frontend ───────────────────────────────────
+# ── Frontend File Routes ─────────────────────────────────────────────
 @app.get("/")
 async def root():
     return FileResponse(str(CLIENT_DIR / "index.html"))
 
-
 @app.get("/app.js")
 async def serve_js():
     return FileResponse(str(CLIENT_DIR / "app.js"), media_type="application/javascript")
-
 
 @app.get("/style.css")
 async def serve_css():
     return FileResponse(str(CLIENT_DIR / "style.css"), media_type="text/css")
 
 
-# ── API: Estado ──────────────────────────────────────────────────────
+# ── API: Status ──────────────────────────────────────────────────────
 @app.get("/api/status")
 async def get_status():
     if not _init_complete:
-        return {
-            "ready": False,
-            "error": _init_error,
-        }
+        return {"ready": False, "error": _init_error}
+        
+    topics = agent.classifier.syllabus if (agent and agent.classifier) else []
     return {
         "ready": True,
-        "n_temas": len(asistente.extractor_temario.temas) if asistente.extractor_temario else 0,
-        "imagen_activa": os.path.basename(asistente.memoria.get_imagen_activa())
-            if asistente.memoria and asistente.memoria.get_imagen_activa() else None,
-        "turno": asistente.memoria.turno_actual if asistente.memoria else 0,
-        "device": asistente.device,
+        "n_temas": len(topics),
+        "imagen_activa": active_image_state_name,
+        "turno": agent.memory.msg_count if (agent and agent.memory) else 0,
+        "device": agent.device if agent else "cpu",
     }
 
 
-# ── API: Temario ─────────────────────────────────────────────────────
+# ── API: Temario (Syllabus) ──────────────────────────────────────────
 @app.get("/api/temario")
 async def get_temario():
     _check_ready()
-    temas = asistente.extractor_temario.temas if asistente.extractor_temario else []
-    return {"temas": temas, "total": len(temas)}
+    topics = agent.classifier.syllabus if (agent and agent.classifier) else []
+    return {"temas": topics, "total": len(topics)}
 
 
-# ── API: Chat (texto plano) ─────────────────────────────────────────
+# ── API: Chat (RAG Engine) ───────────────────────────────────────────
 @app.post("/api/chat", response_model=ChatResponse)
 async def post_chat(req: ChatRequest):
+    global active_image_state_path, active_image_state_name
     _check_ready()
 
-    imagen_path = None
     try:
-        # Si hay imagen, guardarla en un directorio persistente
         if req.image_base64:
             chat_img_dir = Path(__file__).parent / "imagenes_chat"
             chat_img_dir.mkdir(exist_ok=True)
@@ -183,76 +161,57 @@ async def post_chat(req: ChatRequest):
             ext = ".png"
             if req.image_filename:
                 _, ext = os.path.splitext(req.image_filename)
-                if not ext:
-                    ext = ".png"
+                if not ext: ext = ".png"
             
-            # Nombre de archivo único
-            import uuid
-            nombre_archivo = f"upload_{uuid.uuid4().hex[:8]}{ext}"
-            imagen_path = str(chat_img_dir / nombre_archivo)
+            filename = f"upload_{uuid.uuid4().hex[:8]}{ext}"
+            img_path = str(chat_img_dir / filename)
             
-            with open(imagen_path, "wb") as f:
+            with open(img_path, "wb") as f:
                 f.write(base64.b64decode(req.image_base64))
                 
-            print(f"📷 Imagen guardada para chat: {imagen_path}")
+            active_image_state_path = img_path
+            active_image_state_name = req.image_filename or filename
+            print(f"📷 Image loaded to backend state: {active_image_state_name}")
 
-        # Ejecutar consulta RAG
-        respuesta = await asistente.consultar(
-            consulta_texto=req.query,
-            imagen_path=imagen_path,
+        active_img_pil = None
+        if active_image_state_path and os.path.exists(active_image_state_path):
+            active_img_pil = Image.open(active_image_state_path).convert('RGB')
+
+        agent_result = await agent.query(
+            text_query=req.query,
+            session_id=req.session_id,
+            image=active_img_pil,
+            history=[]
         )
 
-        # Leer trayectoria
-        trayectoria = []
-        estructura = None
-        imagenes_rec = []
-        trayectoria_file = Path(__file__).parent / "trayectoria_neo4j.json"
-        if trayectoria_file.exists():
-            try:
-                with open(trayectoria_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                trayectoria = data.get("trayectoria", [])
-                estructura = data.get("estructura_identificada")
-                imagenes_rec = data.get("imagenes_recuperadas", [])
-            except Exception:
-                pass
-
-        img_activa = None
-        if asistente.memoria and asistente.memoria.get_imagen_activa():
-            img_activa = os.path.basename(asistente.memoria.get_imagen_activa())
-
         return ChatResponse(
-            respuesta=respuesta,
-            estructura_identificada=estructura,
-            imagenes_recuperadas=[os.path.basename(p) for p in imagenes_rec],
-            trayectoria=trayectoria,
-            imagen_activa=img_activa,
+            respuesta=agent_result.get("answer", ""),
+            estructura_identificada=agent_result.get("identified_structure"),
+            imagenes_recuperadas=agent_result.get("recovered_images", []),
+            trayectoria=agent_result.get("trajectory", []),
+            imagen_activa=active_image_state_name,
         )
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(500, detail=str(e))
-    finally:
-        pass
 
 
-
-# ── API: Limpiar imagen ──────────────────────────────────────────────
+# ── API: Clear Image ─────────────────────────────────────────────────
 @app.post("/api/imagen/limpiar")
 async def limpiar_imagen():
+    global active_image_state_path, active_image_state_name
     _check_ready()
-    if asistente.memoria:
-        asistente.memoria.set_imagen(None)
-    return {"ok": True, "mensaje": "Imagen activa eliminada"}
+    active_image_state_path = None
+    active_image_state_name = None
+    return {"ok": True, "mensaje": "Active image decoupled"}
 
 
-# ── Main ─────────────────────────────────────────────────────────────
 def main():
     port = int(os.getenv("PORT", "10005"))
-    print(f"🌐 Servidor en http://localhost:{port}")
+    print(f"🌐 Fullstack Server listening at http://localhost:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
 
 if __name__ == "__main__":
     main()

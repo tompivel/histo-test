@@ -3,123 +3,84 @@ import re
 from typing import List, Dict
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from utils.resilience import invoke_con_reintento
+from utils.resilience import invoke_with_retry
+from utils.prompt_loader import load_prompt
 
-class ExtractorTemario:
+class TopicExtractor:
     """
-    Clase responsable de consultar al LLM para extraer y listar el temario 
-    o índice de temas presentes en un corpus de texto histológico.
+    Extracts and lists the topics/syllabus present within a raw histological corpus.
     """
     def __init__(self, llm):
         """
-        Inicializa el Extractor de Temario.
-
+        Initializes the Topic Extractor.
+        
         Args:
-            llm: Modelo conversacional (ej. Groq / Llama) a utilizar.
+            llm: Conversational model used for logic extraction.
         """
-        self.llm   = llm
-        self.temas: List[str] = []
+        self.llm     = llm
+        self.topics: List[str] = []
 
-    async def extraer_temario(self, texto_completo: str) -> List[str]:
+    async def extract_topics(self, full_text: str) -> List[str]:
         """
-        Llama al API del LLM para consolidar un temario exhaustivo basado 
-        en las primeras partes del texto. El resultado se cachea en un archivo JSON local.
-
-        Args:
-            texto_completo (str): Texto crudo volcado desde el manual Base.
-
-        Returns:
-            List[str]: Lista de temas identificados.
+        Calls the LLM API to consolidate an exhaustive syllabus based on text.
         """
-        print("📋 Extrayendo temario...")
-        muestra = texto_completo[:8000]
-        system = (
-            "Eres un experto en histología. Genera una lista EXHAUSTIVA de temas, "
-            "estructuras, tejidos, células, tinciones del manual.\n"
-            "Un tema por línea, sin bullets. Solo la lista."
-        )
+        print("📋 Extracting syllabus...")
+        sample = full_text[:8000]
+        system = load_prompt("topic_extractor.txt")
         try:
-            resp = await invoke_con_reintento(self.llm, [
+            resp = await invoke_with_retry(self.llm, [
                 SystemMessage(content=system),
-                HumanMessage(content=f"TEXTO:\n{muestra}")
+                HumanMessage(content=f"TEXTO:\n{sample}")
             ])
-            temas_raw  = resp.content.strip().split("\n")
-            self.temas = [t.strip() for t in temas_raw if t.strip() and len(t.strip()) > 2]
-            print(f"✅ Temario: {len(self.temas)} temas")
+            topics_raw  = resp.content.strip().split("\n")
+            self.topics = [t.strip() for t in topics_raw if t.strip() and len(t.strip()) > 2]
+            print(f"✅ Syllabus {len(self.topics)} topics extracted")
             with open("temario_histologia.json", "w", encoding="utf-8") as f:
-                json.dump(self.temas, f, ensure_ascii=False, indent=2)
-            return self.temas
+                json.dump(self.topics, f, ensure_ascii=False, indent=2)
+            return self.topics
         except Exception as e:
             print(f"❌ Error: {e}")
             return []
 
-    def get_temario_texto(self) -> str:
+    def get_topics_text(self) -> str:
         """
-        Devuelve el formato texto stringificado del temario, con bullets Markdown.
-
-        Returns:
-            str: Temario textual formateado para inyectarse en los prompts.
+        Returns a stringified format of the syllabus with Markdown bullets.
         """
-        return "\n".join(f"- {t}" for t in self.temas[:100]) if self.temas else "No disponible."
+        return "\n".join(f"- {t}" for t in self.topics[:100]) if self.topics else "No disponible."
 
 
-class ExtractorEntidades:
+class EntityExtractor:
     """
-    Clase dedicada al Procesamiento de Lenguaje Natural para extraer menciones a 
-    tejidos, estructuras celulares y tinciones específicas dentro de strings de texto.
+    NLP module to extract tissues, anatomical structures, and stains from natural text.
     """
     def __init__(self, llm):
-        """
-        Inicializa ExtractorEntidades.
-
-        Args:
-            llm: Agente LLM para extracción robusta de entidades.
-        """
         self.llm = llm
 
-    async def extraer_de_texto(self, texto: str) -> Dict[str, List[str]]:
+    async def extract_from_text(self, text: str) -> Dict[str, List[str]]:
         """
-        Usa el LLM explícitamente para extraer con certeza entidades en consultas del usuario.
-
-        Args:
-            texto (str): Consulta natural del usuario.
-
-        Returns:
-            Dict[str, List[str]]: JSON parseado enumerando entidades clasificadas en:
-                                  `tejidos`, `estructuras`, `tinciones`.
+        Explicitly leverages the LLM to classify entities in user queries.
         """
-        system = (
-            "Extrae entidades histológicas del texto. "
-            'Responde SOLO en JSON: {"tejidos": [...], "estructuras": [...], "tinciones": [...]}\n'
-            "Máximo 3 items por categoría. Si no hay, lista vacía."
-        )
+        system = load_prompt("entity_extractor.txt")
         try:
-            resp = await invoke_con_reintento(self.llm, [
+            resp = await invoke_with_retry(self.llm, [
                 SystemMessage(content=system),
-                HumanMessage(content=texto[:500])
+                HumanMessage(content=text[:700])
             ])
-            texto_resp = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
-            resultado  = json.loads(texto_resp)
+            clean_resp = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
+            result     = json.loads(clean_resp)
             return {
-                "tejidos":     [t.lower() for t in resultado.get("tejidos", [])[:3]],
-                "estructuras": [e.lower() for e in resultado.get("estructuras", [])[:3]],
-                "tinciones":   [t.lower() for t in resultado.get("tinciones", [])[:3]],
+                "tejidos":     [t.lower() for t in result.get("tejidos", [])[:3]],
+                "estructuras": [e.lower() for e in result.get("estructuras", [])[:3]],
+                "tinciones":   [t.lower() for t in result.get("tinciones", [])[:3]],
             }
         except Exception:
             return {"tejidos": [], "estructuras": [], "tinciones": []}
 
-    def extraer_de_texto_sync(self, texto: str) -> Dict[str, List[str]]:
+    def extract_from_text_sync(self, text: str) -> Dict[str, List[str]]:
         """
-        Extrae entidades con operaciones síncronas usando búsqueda local hardcodeada.
-        Ideal para procesar y categorizar veloces chunks de texto de los PDFs de manera masiva.
-
-        Args:
-            texto (str): Texto analizado del chunk.
-
-        Returns:
-            Dict[str, List[str]]: Categorización síncrona extraída sin latencia de red LLM.
+        Extracts entities using synchronous hardcoded keyword matching for rapid ingestion.
         """
-        entidades: Dict[str, List[str]] = {"tejidos": [], "estructuras": [], "tinciones": []}
+        entities: Dict[str, List[str]] = {"tejidos": [], "estructuras": [], "tinciones": []}
         TEJIDOS = [
             "epitelio", "conectivo", "muscular", "nervioso", "cartílago", "hueso",
             "sangre", "linfoide", "hepático", "renal", "pulmonar", "dérmico",
@@ -135,8 +96,8 @@ class ExtractorEntidades:
             "h&e", "hematoxilina", "eosina", "pas", "tricrómico", "grocott",
             "ziehl", "giemsa", "reticulina", "alcian blue", "von kossa"
         ]
-        texto_lower = texto.lower()
-        entidades["tejidos"]     = [t for t in TEJIDOS     if t in texto_lower][:3]
-        entidades["estructuras"] = [e for e in ESTRUCTURAS if e in texto_lower][:3]
-        entidades["tinciones"]   = [t for t in TINCIONES   if t in texto_lower][:3]
-        return entidades
+        text_lower = text.lower()
+        entities["tejidos"]     = [t for t in TEJIDOS     if t in text_lower][:3]
+        entities["estructuras"] = [e for e in ESTRUCTURAS if e in text_lower][:3]
+        entities["tinciones"]   = [t for t in TINCIONES   if t in text_lower][:3]
+        return entities

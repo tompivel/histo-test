@@ -1,21 +1,10 @@
 import asyncio
 import time
 
-async def invoke_con_reintento(llm, messages, max_retries=5):
+async def invoke_with_retry(llm, messages, max_retries=5):
     """
-    Envuelve las peticiones asíncronas a un LLM en LangChain controlando el backoff
-    exponencial cuando ocurre límite de tasa o agotamiento de recursos del servidor.
-
-    Args:
-        llm: Instancia LangChain configurada para ainvoke.
-        messages (list): Lista de diccionarios/objetos HumanMessage o SystemMessage.
-        max_retries (int, opcional): Número máximo de intentos.
-
-    Returns:
-        BaseMessage: Resultado exitoso de la invocación LLM.
-
-    Raises:
-        Exception: Repropaga la falla original si excede los intentos.
+    Wraps asynchronous LangChain LLM requests handling exponential backoff 
+    when rate limits or server exhausted resources occur.
     """
     for attempt in range(max_retries):
         try:
@@ -25,17 +14,17 @@ async def invoke_con_reintento(llm, messages, max_retries=5):
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
                 if attempt < max_retries - 1:
                     espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    print(f"   ⚠️ API Quota Limit/Server Busy (429/503) - retrying in {espera}s... (Attempt {attempt+1}/{max_retries})")
                     await asyncio.sleep(espera)
                 else:
                     raise e
             else:
                 raise e
 
-def invoke_con_reintento_sync(llm, messages, max_retries=5):
+def invoke_with_retry_sync(llm, messages, max_retries=5):
     """
-    Idéntico comportamiento que `invoke_con_reintento` pero paralizando el hilo síncronamente.
-    Ideal para scripts de línea de comando y background fetchers (ej. extracciones offline).
+    Identical behavior to `invoke_with_retry` but paralyzing the thread synchronously.
+    Ideal for CLI scripts and background fetchers.
     """
     for attempt in range(max_retries):
         try:
@@ -45,18 +34,16 @@ def invoke_con_reintento_sync(llm, messages, max_retries=5):
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
                 if attempt < max_retries - 1:
                     espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API/Servidor Ocupado (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    print(f"   ⚠️ API Quota Limit/Server Busy (429/503) - retrying in {espera}s... (Attempt {attempt+1}/{max_retries})")
                     time.sleep(espera)
                 else:
                     raise e
             else:
                 raise e
 
-# vestigial legacy code
-def embed_query_con_reintento(embeddings, texto: str, max_retries=5):
+def embed_query_with_retry(embeddings, texto: str, max_retries=5):
     """
-    Ejecuta backoff transaccional sobre la inferencia local o de API de texto individual 
-    para modelos convertidores a vectores latentes. (Síncrono).
+    Executes transaction backoff over local or API individual text inference. (Synchronous).
     """
     for attempt in range(max_retries):
         try:
@@ -66,18 +53,16 @@ def embed_query_con_reintento(embeddings, texto: str, max_retries=5):
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
                 if attempt < max_retries - 1:
                     espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API en embeddings (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    print(f"   ⚠️ API Quota Limit in Embeddings (429/503) - retrying in {espera}s... (Attempt {attempt+1}/{max_retries})")
                     time.sleep(espera)
                 else:
                     raise e
             else:
                 raise e
 
-# vestigial legacy code
-def embed_documents_con_reintento(embeddings, textos: list, max_retries=5):
+def embed_documents_with_retry(embeddings, textos: list, max_retries=5):
     """
-    Envuelve funciones batch de incrustación de grandes colecciones de documentos
-    proveyendo resistencia contra pausas del servidor API de HuggingFace/Vertex. (Síncrono).
+    Wraps batch functions for large collections providing resilience against HF/Vertex API pauses.
     """
     for attempt in range(max_retries):
         try:
@@ -87,7 +72,7 @@ def embed_documents_con_reintento(embeddings, textos: list, max_retries=5):
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "503" in err_str:
                 if attempt < max_retries - 1:
                     espera = 15 * (attempt + 1)
-                    print(f"   ⚠️ Límite de cuota API en embeddings (429/503) - reintentando en {espera}s... (Intento {attempt+1}/{max_retries})")
+                    print(f"   ⚠️ API Quota Limit in Embeddings (429/503) - retrying in {espera}s... (Attempt {attempt+1}/{max_retries})")
                     time.sleep(espera)
                 else:
                     raise e

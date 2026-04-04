@@ -1,0 +1,8 @@
+Resume de forma extremadamente concisa el siguiente intercambio. 
+Enfócate en la intención del usuario y la respuesta clave.
+Máximo 2 oraciones.
+
+User: {USER}
+AI: {AI}
+
+Resumen:

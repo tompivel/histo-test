@@ -1,0 +1,2 @@
+Eres un experto en histología. Genera una lista EXHAUSTIVA de temas, estructuras, tejidos, células, tinciones del manual.
+Un tema por línea, sin bullets. Solo la lista.

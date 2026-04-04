@@ -1,26 +1,39 @@
 import os
 import glob
-from typing import List, Optional
+from typing import List
 
-from utils.config import DIRECTORIO_PDFS, SIMILAR_IMG_THRESHOLD, userdata
+from utils.config import PDFS_DIR, SIMILAR_IMG_THRESHOLD, userdata
 from db.neo4j_client import Neo4jClient
-from extractors.pdf import ExtractorImagenesPDF
-from extractors.text import ExtractorEntidades, ExtractorTemario
+from extractors.pdf import PDFImageExtractor
+from extractors.text import EntityExtractor, TopicExtractor
 from models.vision import UniWrapper, PlipWrapper
 
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 
-class PipelineIngestion:
+class IngestionPipeline:
     """
-    Módulo ETL (Extract, Transform, Load) para procesar el corpus base y poblar Neo4j.
-    Ideal para ser ejecutado de forma estática y aislada en un Google Colab Notebook 
-    dejando la inferencia/RAG al core.agent.
+    ETL (Extract, Transform, Load) module to process the base corpus and populate Neo4j.
+    Ideal for execution in a static Google Colab environment, offloading inference to core.agent.
     """
-    def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_pass: str, device: str = 'cpu'):
+    def __init__(self, neo4j_uri: str, neo4j_user: str, neo4j_pass: str, device: str = None):
+        import torch
         self.db = Neo4jClient(neo4j_uri, neo4j_user, neo4j_pass)
-        self.device = device
         
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+            
+        if self.device == "cuda":
+            try:
+                cap = torch.cuda.get_device_capability(0)
+                if cap[0] < 7:
+                    print(f"⚠️ Incompatible GPU detected (sm_{cap[0]}{cap[1]}). Forcing CPU to avoid fallback_error.")
+                    self.device = "cpu"
+            except:
+                pass
+        print(f"🚀 Pipeline ETL Initialized on Backend: {self.device.upper()}")
         self.llm = ChatGroq(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             temperature=0.1,
@@ -34,84 +47,83 @@ class PipelineIngestion:
         
         self.uni = UniWrapper(self.device)
         self.plip = PlipWrapper(self.device)
-        self.extractor_imagenes = ExtractorImagenesPDF()
-        self.extractor_entidades = ExtractorEntidades(self.llm)
-        self.extractor_temario = ExtractorTemario(self.llm)
+        self.image_extractor = PDFImageExtractor()
+        self.entity_extractor = EntityExtractor(self.llm)
+        self.topic_extractor = TopicExtractor(self.llm)
 
-    async def inicializar(self):
-        print("🔄 Conectando a la Base de Datos Neo4j y cargando modelos locales...")
+    async def initialize(self):
+        print("🔄 Connecting to Neo4j DB and loading local models...")
         await self.db.connect()
-        await self.db.crear_esquema()
+        await self.db.create_schema()
         self.uni.load()
         self.plip.load()
 
-    def _leer_pdf(self, path: str) -> str:
-        # Lógica cruda y directa usando PyMuPDF
+    def _read_pdf(self, path: str) -> str:
         import fitz
         try:
             doc = fitz.open(path)
-            texto = "\n".join(pagina.get_text() for pagina in doc)
+            text = "\n".join(page.get_text() for page in doc)
             doc.close()
-            return texto
+            return text
         except Exception as e:
-            print(f"⚠️ Error leyendo {path}: {e}")
+            print(f"⚠️ Error reading {path}: {e}")
             return ""
 
-    def _chunks(self, texto: str, size: int = 500) -> List[str]:
-        return [texto[i:i+size] for i in range(0, len(texto), size)]
+    def _chunks(self, text: str, size: int = 500) -> List[str]:
+        return [text[i:i+size] for i in range(0, len(text), size)]
 
-    async def extraer_y_preparar_temario(self, directorio_pdfs: str = DIRECTORIO_PDFS):
-        print("📋 Extrayendo e infiriendo el temario general...")
-        pdfs = glob.glob(os.path.join(directorio_pdfs, "*.pdf"))
+    async def extract_and_prepare_syllabus(self, pdfs_dir: str = PDFS_DIR):
+        print("📋 Extracting and inferring the general syllabus...")
+        pdfs = glob.glob(os.path.join(pdfs_dir, "*.pdf"))
         if not pdfs:
-            print("⚠️ No hay PDFs para extraer temario.")
+            print("⚠️ No PDFs to extract syllabus from.")
             return
 
-        contenido_base = "\n".join(self._leer_pdf(p) for p in pdfs)
-        await self.extractor_temario.extraer_temario(contenido_base)
+        base_content = "\n".join(self._read_pdf(p) for p in pdfs)
+        await self.topic_extractor.extract_topics(base_content)
 
-    async def ejecutar(self, directorio_pdfs: str = DIRECTORIO_PDFS, forzar: bool = False):
+    async def execute(self, pdfs_dir: str = PDFS_DIR, force: bool = False):
         """
-        Orquesta o ejecuta el pipeline completo de indexación vectorial (RAG) y Knowledge Graph en Neo4j.
+        Orchestrates the entire database pipeline population.
         """
-        if not forzar:
+        if not force:
             try:
                 res = await self.db.run("MATCH (c:Chunk) RETURN count(c) AS n")
                 if res and res[0]["n"] > 0:
                     n_chunks = res[0]["n"]
-                    print(f"✅ Base de datos Neo4j ya poblada (Encontrados {n_chunks} nodos 'Chunk').")
-                    print(f"   ( Conectado a: {self.db.uri} )")
-                    print("   Saltando indexación. (Usa forzar=True)")
+                    print(f"✅ Neo4j database already populated (Found {n_chunks} 'Chunk' nodes).")
+                    print(f"   ( Connected to: {self.db.uri} )")
+                    print("   Skipping indexing. (Use force=True)")
                     return
             except Exception as e:
-                print(f"⚠️ Error verificando schema: {e}")
+                print(f"⚠️ Error verifying schema: {e}")
                 pass
 
-        await self.extraer_y_preparar_temario(directorio_pdfs)
+        await self.extract_and_prepare_syllabus(pdfs_dir)
 
-        print("📄 Indexando chunks de texto en Neo4j...")
-        for pdf_path in glob.glob(os.path.join(directorio_pdfs, "*.pdf")):
-            fuente = os.path.basename(pdf_path)
-            await self.db.upsert_pdf(fuente)
-            texto  = self._leer_pdf(pdf_path)
-            chunks = self._chunks(texto)
-            print(f"  {fuente}: {len(chunks)} chunks")
+        print("📄 Indexing text chunks in Neo4j...")
+        for pdf_path in glob.glob(os.path.join(pdfs_dir, "*.pdf")):
+            source = os.path.basename(pdf_path)
+            await self.db.upsert_pdf(source)
+            text  = self._read_pdf(pdf_path)
+            chunks = self._chunks(text)
+            print(f"  {source}: {len(chunks)} chunks")
             for i, chunk in enumerate(chunks):
                 if not chunk.strip(): continue
                 try:
                     emb       = self.embeddings.embed_query(chunk)
-                    chunk_id  = f"chunk_{fuente}_{i}"
-                    entidades = self.extractor_entidades.extraer_de_texto_sync(chunk)
+                    chunk_id  = f"chunk_{source}_{i}"
+                    entities  = self.entity_extractor.extract_from_text_sync(chunk)
                     await self.db.upsert_chunk(
-                        chunk_id=chunk_id, texto=chunk, fuente=fuente,
-                        chunk_idx=i, embedding=emb, entidades=entidades
+                        chunk_id=chunk_id, texto=chunk, fuente=source,
+                        chunk_idx=i, embedding=emb, entidades=entities
                     )
                 except Exception as e:
                     print(f"  ⚠️ Chunk {i}: {e}")
 
-        print("📸 Extrayendo e Indexando imágenes de PDFs (Vision Models)...")
-        imagenes_pdf = self.extractor_imagenes.extraer_de_directorio(directorio_pdfs)
-        for img_info in imagenes_pdf:
+        print("📸 Extracting and Indexing PDF images (Vision Models)...")
+        pdf_images = self.image_extractor.extract_from_directory(pdfs_dir)
+        for img_info in pdf_images:
             img_path = img_info["path"]
             if not os.path.exists(img_path):
                 continue
@@ -119,22 +131,22 @@ class PipelineIngestion:
                 emb_u  = self.uni.embed_image(img_path)
                 emb_p  = self.plip.embed_image(img_path)
                 
-                img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
+                img_id = f"img_{img_info['source_pdf']}_{img_info['page']}"
                 
-                await self.db.upsert_imagen(
-                    imagen_id=img_id, path=img_path,
-                    fuente=img_info["fuente_pdf"], pagina=img_info["pagina"],
+                await self.db.upsert_image(
+                    image_id=img_id, path=img_path,
+                    source=img_info["source_pdf"], page=img_info["page"],
                     ocr_text=img_info.get("ocr_text", ""),
-                    texto_pagina=img_info.get("texto_pagina", ""),
+                    page_text=img_info.get("page_text", ""),
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist()
                 )
             except Exception as e:
-                print(f"  ⚠️ Imagen {img_path}: {e}")
+                print(f"  ⚠️ Image {img_path}: {e}")
 
-        print("🔗 Construyendo relaciones de similitud visual K-NN...")
-        await self.db.crear_relaciones_similitud(SIMILAR_IMG_THRESHOLD)
-        print("✅ Indexación ETL completada satisfactoriamente.")
+        print("🔗 Building K-NN visual similarity relations...")
+        await self.db.create_similarity_relations(SIMILAR_IMG_THRESHOLD)
+        print("✅ ETL indexing completed successfully.")
 
-    async def cerrar(self):
+    async def close(self):
         await self.db.close()

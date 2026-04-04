@@ -1,0 +1,2 @@
+Extrae entidades histológicas del texto. Responde SOLO en JSON: {"tejidos": [...], "estructuras": [...], "tinciones": [...]}
+Máximo 3 items por categoría. Si no hay, lista vacía.

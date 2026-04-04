@@ -3,22 +3,20 @@ import io
 import asyncio
 from PIL import Image
 
-from core.agent import AsistenteHistologiaNeo4j
+from core.agent import Neo4jHistologyAgent
 from utils.config import userdata
 
-async def modo_interactivo():
+async def interactive_mode():
     """
-    Inicia la Interfaz de Línea de Comandos (CLI) para interactuar con la consola asíncrona.
+    Initializes the Command Line Interface (CLI) for asynchronous terminal iteration.
     
-    Gestiona el bucle principal de evento donde:
-    1. Se recuperan credenciales esenciales.
-    2. Se infla el "AsistenteHistologiaNeo4j".
-    3. Se evalúan comandos especiales como 'salir' o prefijos 'imagen /ruta' 
-       mientras se acumula la memoria de contexto y se renderizan respuestas.
+    1. Grabs credentials.
+    2. Inflates Neo4jHistologyAgent.
+    3. Handles loops for chat memory and images.
     """
     print("""
 ============================================================
-🔬 ASISTENTE DE HISTOLOGÍA - RAG MULTIMODAL GROQ (v4.3) 🔬
+🔬 ASISTENTE DE HISTOLOGÍA - RAG MULTIMODAL GROQ (v4.4) 🔬
 ============================================================
 Usando Llama-4-17B, LangGraph, UNI + PLIP, Neo4j, Qdrant
 ------------------------------------------------------------
@@ -32,15 +30,15 @@ Comandos:
     neo4j_user = userdata.get('NEO4J_USERNAME') or "neo4j"
     neo4j_pass = userdata.get('NEO4J_PASSWORD') or "password"
     
-    asistente = AsistenteHistologiaNeo4j(neo4j_uri, neo4j_user, neo4j_pass)
-    await asistente.initialize()
+    agent = Neo4jHistologyAgent(neo4j_uri, neo4j_user, neo4j_pass)
+    await agent.initialize()
     
     chat_history = []
-    imagen_activa = None
+    active_image = None
     
     while True:
         try:
-            if imagen_activa:
+            if active_image:
                 print("\n[📷 Imagen cargada y lista para la siguiente pregunta]")
             user_input = input("\n👤 Tu consulta: ").strip()
             
@@ -51,26 +49,28 @@ Comandos:
                 break
                 
             if user_input.lower().startswith('imagen '):
-                rut = user_input[7:].strip()
-                if os.path.exists(rut):
+                route = user_input[7:].strip()
+                if os.path.exists(route):
                     try:
-                        imagen_activa = Image.open(rut).convert('RGB')
-                        print(f"✅ Imagen '{os.path.basename(rut)}' cargada en memoria temporal.")
+                        active_image = Image.open(route).convert('RGB')
+                        print(f"✅ Imagen '{os.path.basename(route)}' cargada en memoria temporal.")
                         continue
                     except Exception as e:
                         print(f"❌ Error leyendo imagen: {e}")
                         continue
                 else:
-                    print(f"❌ La ruta no existe: {rut}")
+                    print(f"❌ La ruta no existe: {route}")
                     continue
             
             print("⏳ Analizando y procesando (LangGraph en curso)...")
-            respuesta = await asistente.consultar(user_input, imagen=imagen_activa, history=chat_history)
+            agent_result = await agent.query(user_input, session_id="cli_local", image=active_image, history=chat_history)
             
-            print(f"\n🧠 ASISTENTE:\n{respuesta}\n")
+            print(f"\n🧠 ASISTENTE:\n{agent_result.get('answer', '')}\n")
+            if agent_result.get("identified_structure"):
+                print(f"   🏷️  Diagnóstico Visual: {agent_result['identified_structure']}")
             print("-" * 60)
             
-            imagen_activa = None
+            active_image = None
             
         except KeyboardInterrupt:
             print("\n👋  Saliendo...")
@@ -78,4 +78,4 @@ Comandos:
         except Exception as e:
             print(f"\n❌ Error inferencia: {e}")
 
-    await asistente.db.close()
+    await agent.db.close()
