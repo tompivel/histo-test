@@ -7,6 +7,11 @@ __pycache__/
 *.pyc
 *.egg-info/
 
+#Editor
+.vscode/
+.idea/
+.DS_Store
+
 # Extracted data
 imagenes_extraidas/
 logs/
