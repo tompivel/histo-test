@@ -229,8 +229,8 @@ class AsistenteHistologiaNeo4j:
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
                 state["imagen_usuario"].convert('RGB').save(tmp.name)
                 tmp_path = tmp.name
-            emb_uni_usr = self.vision_uni.embed_image(tmp_path)
-            emb_plip_usr = self.vision_plip.embed_image(tmp_path)
+            emb_uni_usr = self.vision_uni.embed_image(tmp_path).tolist()
+            emb_plip_usr = self.vision_plip.embed_image(tmp_path).tolist()
             os.remove(tmp_path)
             
         resultados = await self.db.busqueda_hibrida(emb_query, emb_uni_usr, emb_plip_usr, entidades, top_k=8)

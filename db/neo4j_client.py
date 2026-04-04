@@ -509,16 +509,16 @@ class Neo4jClient:
         res_ent   = []
         res_vec   = []
 
-        # 1. Búsqueda Texto (Gemini)
-        if texto_embedding:
+        # 1. Búsqueda Texto (Gemini/Local)
+        if texto_embedding is not None:
             res_texto = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k)
 
         # 2. Búsqueda Imagen UNI
-        if imagen_embedding_uni:
+        if imagen_embedding_uni is not None:
             res_uni = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
 
         # 3. Búsqueda Imagen PLIP
-        if imagen_embedding_plip:
+        if imagen_embedding_plip is not None:
             res_plip = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
 
         # 4. Entidades
