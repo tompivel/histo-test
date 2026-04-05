@@ -12,6 +12,7 @@ Run in the colab notebook set up in [here](https://colab.research.google.com/dri
 ## 1st Case: Sending a totally unrelated picture
 The image we will be using for this test is:
 ![alt text](imagenes_chat/unrelated.jpg)
+- [Langsmith Trace](https://smith.langchain.com/public/83c28305-243e-4013-ae3e-a4768a59a4dd/r)
 ### Input
 ```
 👤 Tu consulta: imagen imagenes_chat/unrelated.jpg
@@ -54,6 +55,7 @@ The agent correctly declines trying to answer an unrelated question.
 ## 2nd Case: Sending a related picture (screenshot from the pdf)
 The image we will be using for this test is a screnshot from the manual.
 ![alt text](imagenes_chat/upload_77c47a5c.jpg)
+- [Langsmith Trace](https://smith.langchain.com/public/870e6ffc-ee1e-4b2c-9117-78d0d943d84a/r)
 ### Input
 ```
 👤 Tu consulta: imagen /content/histo-test/imagenes_chat/upload_77c47a5c.jpg
@@ -117,6 +119,9 @@ En base a las características observadas en la imagen histológica y la informa
 ------------------------------------------------------------
 ```
 
+### Analysis
+The real image from the pdf the screenshot maps to is placed 4th in the retrieval process.
+
 ### Conclusion
 The LLM correctly identifies the image from the manual and provides its description.
 
@@ -125,6 +130,7 @@ In this case we will be using an image from a brain biopsy.
 
 ![alt text](https://globetechcdn.com/mobile_es_labmedica/images/stories/articles/article_images/2015-12-16/RLJ-381a.jpg)
 
+- [Langsmith Trace](https://smith.langchain.com/public/f5cfd32e-9290-4716-af75-fa0c9734b709/r)
 According to the web from which this image was retrieved, the image depicts: "Imagen A: Una histopatología de la carcinomatosis meníngea: grupos de células tumorales en el espacio subaracnoideo en una biopsia cerebral (Fotografía cortesía del Dr. Michael J. Schneck, MD).".
 ### Input
 ```
@@ -195,3 +201,6 @@ It correctly identified the patology (Meningioma) even when the image wasn't in 
 
 However, it also said: "Dada la morfología y la tinción, es posible que esta imagen corresponda a una sección de un tumor o una lesión específica. Sin embargo, sin más contexto o información, es difícil proporcionar un diagnóstico preciso.".
 
+## Recommendations and Questions
+- Why is the semantic similarity from the user query always the same? Is it hardcoded?
+- Why in the second case the correct image was placed 4th?
