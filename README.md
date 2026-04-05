@@ -71,7 +71,7 @@ El sistema organiza el conocimiento en los siguientes nodos y relaciones dentro 
 Existen diversos flujos diseñados específicamente para su respectiva plataforma de ejecución:
 
 **Opción A: Ingestión Remota en Google Colab (Pre-Procesado masivo)**
-Sube el archivo `notebooks/Ingesta_Neo4J_Histo.ipynb` a Google Colab. Asigna una instancia T4 GPU, incluye los secretos arriba mencionados y ejecuta la Celda 2. Extraerá las imágenes masivamente de tus PDFs hacia el índice vectorial de Neo4j en la Nube.
+Sube el archivo `notebooks/Ingesta_Neo4J_Histo.ipynb` a Google Colab o copialo de este [link](https://colab.research.google.com/drive/1r7AawAnFF_2yCxp4O37n64f3LiX8Lvk1?usp=sharing). Asigna una instancia T4 GPU, incluye los secretos arriba mencionados y ejecuta la Celda 2. Extraerá las imágenes masivamente de tus PDFs hacia el índice vectorial de Neo4j en la Nube.
 
 **Opción B: Chat Interactivo Frontend (Inferencia UI Local)**
 Para ejecutar la interfaz gráfica y levantar todo el sistema cliente-servidor, que incluye `server.py` escuchando a la lógica de RAG y el renderizado del código cliente reactivo:
