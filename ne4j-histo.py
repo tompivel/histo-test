@@ -349,6 +349,7 @@ class Neo4jClient:
             "CREATE CONSTRAINT tejido_nombre IF NOT EXISTS FOR (t:Tejido) REQUIRE t.nombre IS UNIQUE",
             "CREATE CONSTRAINT estructura_nombre IF NOT EXISTS FOR (e:Estructura) REQUIRE e.nombre IS UNIQUE",
             "CREATE CONSTRAINT tincion_nombre IF NOT EXISTS FOR (t:Tincion) REQUIRE t.nombre IS UNIQUE",
+            "CREATE CONSTRAINT tabla_id IF NOT EXISTS FOR (t:Tabla) REQUIRE t.id IS UNIQUE",
         ]
         for c in constraints:
             try:
@@ -419,7 +420,7 @@ class Neo4jClient:
 
     async def upsert_chunk(self, chunk_id: str, texto: str, fuente: str,
                             chunk_idx: int, embedding: List[float],
-                            entidades: Dict[str, List[str]]):
+                            entidades: Dict[str, List]):
         await self.run("""
             MERGE (c:Chunk {id: $id})
             SET c.texto = $texto, c.fuente = $fuente,
@@ -431,44 +432,62 @@ class Neo4jClient:
             "id": chunk_id, "texto": texto, "fuente": fuente,
             "chunk_idx": chunk_idx, "embedding": embedding
         })
+        # ── Tejidos con normalización SNOMED/FMA ──
         for tejido in entidades.get("tejidos", []):
+            t_nombre = tejido.get("nombre", tejido) if isinstance(tejido, dict) else tejido
+            snomed_id = tejido.get("snomed_id") if isinstance(tejido, dict) else None
+            fma_id = tejido.get("fma_id") if isinstance(tejido, dict) else None
             await self.run("""
                 MERGE (t:Tejido {nombre: $nombre})
+                SET t.snomed_id = coalesce($snomed_id, t.snomed_id),
+                    t.fma_id = coalesce($fma_id, t.fma_id)
                 WITH t MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(t)
-            """, {"nombre": tejido, "chunk_id": chunk_id})
+            """, {"nombre": t_nombre, "chunk_id": chunk_id,
+                  "snomed_id": snomed_id, "fma_id": fma_id})
+        # ── Estructuras con normalización SNOMED ──
         for estructura in entidades.get("estructuras", []):
+            e_nombre = estructura.get("nombre", estructura) if isinstance(estructura, dict) else estructura
+            snomed_id = estructura.get("snomed_id") if isinstance(estructura, dict) else None
             await self.run("""
                 MERGE (e:Estructura {nombre: $nombre})
+                SET e.snomed_id = coalesce($snomed_id, e.snomed_id)
                 WITH e MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(e)
-            """, {"nombre": estructura, "chunk_id": chunk_id})
+            """, {"nombre": e_nombre, "chunk_id": chunk_id,
+                  "snomed_id": snomed_id})
         for tincion in entidades.get("tinciones", []):
             await self.run("""
                 MERGE (t:Tincion {nombre: $nombre})
                 WITH t MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(t)
             """, {"nombre": tincion, "chunk_id": chunk_id})
-        for tejido in entidades.get("tejidos", []):
-            for estructura in entidades.get("estructuras", []):
+        # ── Relaciones cruzadas (normalizando dicts a strings) ──
+        tejidos_lista = [t.get("nombre", t) if isinstance(t, dict) else t
+                         for t in entidades.get("tejidos", [])]
+        estructuras_lista = [e.get("nombre", e) if isinstance(e, dict) else e
+                             for e in entidades.get("estructuras", [])]
+        tinciones_lista = entidades.get("tinciones", [])
+        for t in tejidos_lista:
+            for e in estructuras_lista:
                 await self.run("""
-                    MERGE (t:Tejido {nombre: $tejido})
-                    MERGE (e:Estructura {nombre: $estructura})
-                    MERGE (t)-[:CONTIENE]->(e)
-                """, {"tejido": tejido, "estructura": estructura})
-            for tincion in entidades.get("tinciones", []):
+                    MERGE (tej:Tejido {nombre: $tejido})
+                    MERGE (est:Estructura {nombre: $estructura})
+                    MERGE (tej)-[:CONTIENE]->(est)
+                """, {"tejido": t, "estructura": e})
+            for ti in tinciones_lista:
                 await self.run("""
-                    MERGE (t:Tejido {nombre: $tejido})
-                    MERGE (ti:Tincion {nombre: $tincion})
-                    MERGE (t)-[:TENIDA_CON]->(ti)
-                """, {"tejido": tejido, "tincion": tincion})
-        for estructura in entidades.get("estructuras", []):
-            for tincion in entidades.get("tinciones", []):
+                    MERGE (tej:Tejido {nombre: $tejido})
+                    MERGE (tinc:Tincion {nombre: $tincion})
+                    MERGE (tej)-[:TENIDA_CON]->(tinc)
+                """, {"tejido": t, "tincion": ti})
+        for e in estructuras_lista:
+            for ti in tinciones_lista:
                 await self.run("""
-                    MERGE (e:Estructura {nombre: $estructura})
-                    MERGE (ti:Tincion {nombre: $tincion})
-                    MERGE (e)-[:TENIDA_CON]->(ti)
-                """, {"estructura": estructura, "tincion": tincion})
+                    MERGE (est:Estructura {nombre: $estructura})
+                    MERGE (tinc:Tincion {nombre: $tincion})
+                    MERGE (est)-[:TENIDA_CON]->(tinc)
+                """, {"estructura": e, "tincion": ti})
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str, texto_pagina: str,
@@ -489,6 +508,23 @@ class Neo4jClient:
             "id": imagen_id, "path": path, "fuente": fuente,
             "pagina": pagina, "ocr_text": ocr_text, "texto_pagina": texto_pagina,
             "emb_uni": emb_uni, "emb_plip": emb_plip
+        })
+
+    async def upsert_tabla(self, tabla_id: str, contenido_md: str, fuente: str,
+                           pagina: int, embedding: Optional[List[float]] = None):
+        """Inserta o actualiza un nodo :Tabla con su contenido Markdown."""
+        await self.run("""
+            MERGE (t:Tabla {id: $id})
+            SET t.contenido_md = $contenido_md, t.fuente = $fuente,
+                t.pagina = $pagina, t.embedding = $embedding
+            WITH t
+            MERGE (pdf:PDF {nombre: $fuente})
+            MERGE (t)-[:PERTENECE_A]->(pdf)
+            MERGE (pag:Pagina {numero: $pagina, pdf_nombre: $fuente})
+            MERGE (t)-[:EN_PAGINA]->(pag)
+        """, {
+            "id": tabla_id, "contenido_md": contenido_md, "fuente": fuente,
+            "pagina": pagina, "embedding": embedding
         })
 
     async def crear_relaciones_similitud(self, umbral: float = SIMILAR_IMG_THRESHOLD):
@@ -696,6 +732,18 @@ class Neo4jClient:
         if top_ids:
             res_vec = await self.expandir_vecindad(top_ids)
 
+        # ── Near-duplicate detection (UNI ∩ PLIP con score ≥ 0.95) ──
+        near_dup_ids = set()
+        if res_uni and res_plip:
+            uni_scores = {r["id"]: r["similitud"] for r in res_uni if r.get("id")}
+            plip_scores = {r["id"]: r["similitud"] for r in res_plip if r.get("id")}
+            for img_id in uni_scores:
+                if img_id in plip_scores:
+                    if uni_scores[img_id] >= 0.95 and plip_scores[img_id] >= 0.95:
+                        near_dup_ids.add(img_id)
+            if near_dup_ids:
+                print(f"   🎯 Near-duplicates detectados: {near_dup_ids}")
+
         combined: Dict[str, Dict] = {}
 
         def agregar(resultados: List[Dict], peso: float):
@@ -704,6 +752,9 @@ class Neo4jClient:
                 if not r.get("texto") and not r.get("imagen_path"):
                     continue
                 sim_ponderada = r.get("similitud", 0) * peso
+                # Near-duplicate boost ×2.0
+                if r.get("id") in near_dup_ids:
+                    sim_ponderada *= 2.0
                 if key not in combined:
                     combined[key] = {**r, "similitud": sim_ponderada}
                 else:
@@ -719,7 +770,8 @@ class Neo4jClient:
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
         print(f"   📊 Híbrida: Txt={len(res_texto)} | "
-              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
+              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}"
+              + (f" | 🎯 NearDup={len(near_dup_ids)}" if near_dup_ids else ""))
 
         return final[:15]
 
@@ -1041,8 +1093,9 @@ class ExtractorImagenesPDF:
     MIN_WIDTH  = 200
     MIN_HEIGHT = 200
 
-    def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES):
+    def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES, llm=None):
         self.directorio_salida = directorio_salida
+        self.llm = llm
         os.makedirs(directorio_salida, exist_ok=True)
 
     def extraer_de_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
@@ -1163,6 +1216,55 @@ class ExtractorImagenesPDF:
         print(f"✅ Total imágenes: {len(todas)}")
         return todas
 
+    async def _detectar_y_extraer_tabla(self, imagen_path: str) -> str:
+        """Usa un LLM multimodal para detectar y formatear tablas en la página.
+        Intenta Groq Vision primero, con fallback a Gemini."""
+        if not self.llm:
+            return ""
+        try:
+            with open(imagen_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+
+            msg = HumanMessage(content=[
+                {"type": "text", "text": (
+                    "Analiza esta imagen de una página de un manual de histología.\n"
+                    "Si encuentras tablas con datos técnicos, extráelas en formato Markdown.\n"
+                    "Si no hay tablas, responde únicamente con 'SIN_TABLAS'."
+                )},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}}
+            ])
+
+            # Intento 1: Groq Vision
+            try:
+                llm_vision = ChatGroq(
+                    model="llama-3.2-11b-vision-preview",
+                    api_key=userdata.get("GROQ_API_KEY"),
+                    temperature=0, max_retries=1
+                )
+                resp = await invoke_con_reintento(llm_vision, [msg])
+                texto = resp.content.strip()
+                return "" if "SIN_TABLAS" in texto else texto
+            except Exception as e_groq:
+                print(f"  ⚠️ Groq vision no disponible: {e_groq}")
+
+            # Intento 2: Fallback a Gemini
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                llm_gemini = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash",
+                    google_api_key=userdata.get("GOOGLE_API_KEY"),
+                    temperature=0,
+                )
+                resp = await invoke_con_reintento(llm_gemini, [msg])
+                texto = resp.content.strip()
+                return "" if "SIN_TABLAS" in texto else texto
+            except Exception as e_gemini:
+                print(f"  ⚠️ Gemini fallback también falló: {e_gemini}")
+                return ""
+        except Exception as e:
+            print(f"  ⚠️ Error detectando tabla: {e}")
+            return ""
+
 
 # =============================================================================
 # EXTRACTOR DE TEMARIO
@@ -1208,22 +1310,25 @@ class ExtractorEntidades:
     def __init__(self, llm):
         self.llm = llm
 
-    async def extraer_de_texto(self, texto: str) -> Dict[str, List[str]]:
+    async def extraer_de_texto(self, texto: str) -> Dict[str, List]:
         system = (
-            "Extrae entidades histológicas del texto. "
-            'Responde SOLO en JSON: {"tejidos": [...], "estructuras": [...], "tinciones": [...]}\n'
-            "Máximo 3 items por categoría. Si no hay, lista vacía."
+            "Extrae entidades histológicas y normalízalas a ontologías (SNOMED CT / FMA).\n"
+            "Para cada TEJIDO, busca su nombre técnico, ID SNOMED y ID FMA.\n"
+            "Para cada ESTRUCTURA, busca su nombre técnico e ID SNOMED.\n"
+            'Responde SOLO en JSON: {"tejidos": [{"nombre": "...", "snomed_id": "...", "fma_id": "..."}, ...], '
+            '"estructuras": [{"nombre": "...", "snomed_id": "..."}, ...], "tinciones": [...]}\n'
+            "Máximo 3 items por categoría. Si no sabés el ID, poné null."
         )
         try:
             resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
-                HumanMessage(content=texto[:500])
+                HumanMessage(content=texto[:1000])
             ])
             texto_resp = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
             resultado  = json.loads(texto_resp)
             return {
-                "tejidos":     [t.lower() for t in resultado.get("tejidos", [])[:3]],
-                "estructuras": [e.lower() for e in resultado.get("estructuras", [])[:3]],
+                "tejidos":     resultado.get("tejidos", [])[:3],
+                "estructuras": resultado.get("estructuras", [])[:3],
                 "tinciones":   [t.lower() for t in resultado.get("tinciones", [])[:3]],
             }
         except Exception:
@@ -1349,6 +1454,7 @@ class AsistenteHistologiaNeo4j:
         )
         self.extractor_temario   = ExtractorTemario(llm=self.llm)
         self.extractor_entidades = ExtractorEntidades(llm=self.llm)
+        self.extractor_imagenes.llm = self.llm  # Inyectar LLM para detección de tablas
         self.clasificador_semantico = ClasificadorSemantico(
             llm=self.llm,
             embeddings=self.embeddings, # Gemini
@@ -2030,8 +2136,44 @@ class AsistenteHistologiaNeo4j:
             print(f"⚠️ Error leyendo {path}: {e}")
             return ""
 
-    def _chunks(self, texto: str, size: int = 500) -> List[str]:
-        return [texto[i:i+size] for i in range(0, len(texto), size)]
+    def _chunks(self, text: str, chunk_size: int = 800, chunk_overlap: int = 150) -> List[str]:
+        """RecursiveCharacterTextSplitter: separadores jerárquicos con overlap."""
+        separators = ["\n\n", "\n", ". ", " ", ""]
+
+        def _split_recursive(t, seps):
+            if len(t) <= chunk_size:
+                return [t]
+            sep = seps[0]
+            if len(seps) > 1:
+                splits = t.split(sep)
+            else:
+                return [t[i:i+chunk_size] for i in range(0, len(t), chunk_size - chunk_overlap)]
+            current_chunk = ""
+            results = []
+            for s in splits:
+                if len(current_chunk) + len(s) + len(sep) <= chunk_size:
+                    current_chunk += (sep if current_chunk else "") + s
+                else:
+                    if current_chunk:
+                        results.append(current_chunk)
+                    if len(s) > chunk_size:
+                        results.extend(_split_recursive(s, seps[1:]))
+                        current_chunk = ""
+                    else:
+                        current_chunk = s
+            if current_chunk:
+                results.append(current_chunk)
+            # Overlap
+            overlapped = []
+            for i, res in enumerate(results):
+                if i > 0:
+                    overlap_txt = results[i-1][-chunk_overlap:]
+                    overlapped.append(overlap_txt + res)
+                else:
+                    overlapped.append(res)
+            return overlapped
+
+        return _split_recursive(text, separators)
 
     def procesar_contenido_base(self, directorio: str = DIRECTORIO_PDFS) -> str:
         pdfs = glob.glob(os.path.join(directorio, "*.pdf"))
@@ -2109,6 +2251,23 @@ class AsistenteHistologiaNeo4j:
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist()
                 )
+
+                # ── Detección y extracción de tablas multimodales ──
+                try:
+                    tabla_md = await self.extractor_imagenes._detectar_y_extraer_tabla(img_path)
+                    if tabla_md:
+                        tabla_id = f"tabla_{img_info['fuente_pdf']}_{img_info['pagina']}"
+                        await self.neo4j.upsert_tabla(
+                            tabla_id=tabla_id,
+                            contenido_md=tabla_md,
+                            fuente=img_info["fuente_pdf"],
+                            pagina=img_info["pagina"],
+                            embedding=emb_u.tolist()
+                        )
+                        print(f"  📊 Tabla detectada en {os.path.basename(img_path)}")
+                except Exception as e_tabla:
+                    print(f"  ⚠️ Error tabla {os.path.basename(img_path)}: {e_tabla}")
+
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
 
