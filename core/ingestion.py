@@ -2,6 +2,8 @@ import os
 import glob
 from typing import List
 
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from utils.config import PDFS_DIR, SIMILAR_IMG_THRESHOLD, userdata
 from db.neo4j_client import Neo4jClient
 from extractors.pdf import PDFImageExtractor
@@ -47,9 +49,17 @@ class IngestionPipeline:
         
         self.uni = UniWrapper(self.device)
         self.plip = PlipWrapper(self.device)
-        self.image_extractor = PDFImageExtractor()
+        self.image_extractor = PDFImageExtractor(llm=self.llm)
         self.entity_extractor = EntityExtractor(self.llm)
         self.topic_extractor = TopicExtractor(self.llm)
+
+        # Chunking with RecursiveCharacterTextSplitter (hierarchical separators)
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ". ", " ", ""],
+            length_function=len,
+        )
 
     async def initialize(self):
         print("🔄 Connecting to Neo4j DB and loading local models...")
@@ -69,8 +79,9 @@ class IngestionPipeline:
             print(f"⚠️ Error reading {path}: {e}")
             return ""
 
-    def _chunks(self, text: str, size: int = 500) -> List[str]:
-        return [text[i:i+size] for i in range(0, len(text), size)]
+    def _chunks(self, text: str) -> List[str]:
+        """Splits text using RecursiveCharacterTextSplitter with hierarchical separators."""
+        return self.text_splitter.split_text(text)
 
     async def extract_and_prepare_syllabus(self, pdfs_dir: str = PDFS_DIR):
         print("📋 Extracting and inferring the general syllabus...")
@@ -141,6 +152,24 @@ class IngestionPipeline:
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist()
                 )
+
+                # ── Table detection via multimodal LLM (Groq Vision → Gemini fallback) ──
+                try:
+                    tabla_md = await self.image_extractor.detect_and_extract_table(img_path)
+                    if tabla_md:
+                        tabla_id = f"tabla_{img_info['source_pdf']}_{img_info['page']}"
+                        tabla_emb = self.embeddings.embed_query(tabla_md[:800])
+                        await self.db.upsert_table(
+                            tabla_id=tabla_id,
+                            contenido_md=tabla_md,
+                            source=img_info["source_pdf"],
+                            page=img_info["page"],
+                            embedding=tabla_emb
+                        )
+                        print(f"  📊 Table extracted from page {img_info['page']}")
+                except Exception as e_tabla:
+                    print(f"  ⚠️ Table detection page {img_info['page']}: {e_tabla}")
+
             except Exception as e:
                 print(f"  ⚠️ Image {img_path}: {e}")
 

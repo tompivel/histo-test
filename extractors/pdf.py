@@ -1,4 +1,5 @@
 import os
+import base64
 import fitz # PyMuPDF
 from PIL import Image
 try:
@@ -10,7 +11,10 @@ try:
     import pytesseract
 except ImportError:
     pass
-from typing import List, Dict
+from typing import List, Dict, Optional
+
+from langchain_core.messages import HumanMessage
+from utils.resilience import invoke_with_retry
 
 from utils.config import IMG_DIR
 
@@ -22,8 +26,9 @@ class PDFImageExtractor:
     MIN_WIDTH  = 200
     MIN_HEIGHT = 200
 
-    def __init__(self, output_dir: str = IMG_DIR):
+    def __init__(self, output_dir: str = IMG_DIR, llm=None):
         self.output_dir = output_dir
+        self.llm = llm
         os.makedirs(output_dir, exist_ok=True)
 
     def extract_from_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
@@ -138,3 +143,56 @@ class PDFImageExtractor:
             all_imgs.extend(self.extract_from_pdf(pdf_path))
         print(f"✅ Total images extracted: {len(all_imgs)}")
         return all_imgs
+
+    async def detect_and_extract_table(self, image_path: str) -> str:
+        """Uses a multimodal LLM to detect and format tables in the page image.
+        Attempts Groq Vision first, with fallback to Gemini 2.5 Flash.
+        Returns Markdown table string or empty string if no table found."""
+        if not self.llm:
+            return ""
+        try:
+            with open(image_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+
+            msg = HumanMessage(content=[
+                {"type": "text", "text": (
+                    "Analiza esta imagen de una página de un manual de histología.\n"
+                    "Si encuentras tablas con datos técnicos, extráelas en formato Markdown.\n"
+                    "Si no hay tablas, responde únicamente con 'SIN_TABLAS'."
+                )},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}}
+            ])
+
+            # Attempt 1: Groq Vision
+            try:
+                from langchain_groq import ChatGroq
+                from utils.config import userdata
+                llm_vision = ChatGroq(
+                    model="llama-3.2-11b-vision-preview",
+                    api_key=userdata.get("GROQ_API_KEY"),
+                    temperature=0, max_retries=1
+                )
+                resp = await invoke_with_retry(llm_vision, [msg])
+                text = resp.content.strip()
+                return "" if "SIN_TABLAS" in text else text
+            except Exception as e_groq:
+                print(f"  ⚠️ Groq Vision unavailable: {e_groq}")
+
+            # Attempt 2: Fallback to Gemini 2.5 Flash
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                from utils.config import userdata
+                llm_gemini = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash",
+                    google_api_key=userdata.get("GOOGLE_API_KEY"),
+                    temperature=0,
+                )
+                resp = await invoke_with_retry(llm_gemini, [msg])
+                text = resp.content.strip()
+                return "" if "SIN_TABLAS" in text else text
+            except Exception as e_gemini:
+                print(f"  ⚠️ Gemini fallback also failed: {e_gemini}")
+                return ""
+        except Exception as e:
+            print(f"  ⚠️ Table detection error: {e}")
+            return ""

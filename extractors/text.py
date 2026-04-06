@@ -56,22 +56,23 @@ class EntityExtractor:
     def __init__(self, llm):
         self.llm = llm
 
-    async def extract_from_text(self, text: str) -> Dict[str, List[str]]:
+    async def extract_from_text(self, text: str) -> Dict[str, list]:
         """
-        Explicitly leverages the LLM to classify entities in user queries.
+        Leverages the LLM to extract entities with SNOMED CT / FMA ontology normalization.
+        Returns dicts with {nombre, snomed_id, fma_id} for tissues/structures.
         """
         system = load_prompt("entity_extractor.txt")
         try:
             resp = await invoke_with_retry(self.llm, [
                 SystemMessage(content=system),
-                HumanMessage(content=text[:700])
+                HumanMessage(content=text[:1000])
             ])
             clean_resp = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
             result     = json.loads(clean_resp)
             return {
-                "tejidos":     [t.lower() for t in result.get("tejidos", [])[:3]],
-                "estructuras": [e.lower() for e in result.get("estructuras", [])[:3]],
-                "tinciones":   [t.lower() for t in result.get("tinciones", [])[:3]],
+                "tejidos":     result.get("tejidos", [])[:3],
+                "estructuras": result.get("estructuras", [])[:3],
+                "tinciones":   [t.lower() if isinstance(t, str) else t for t in result.get("tinciones", [])[:3]],
             }
         except Exception:
             return {"tejidos": [], "estructuras": [], "tinciones": []}

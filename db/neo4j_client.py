@@ -42,6 +42,7 @@ class Neo4jClient:
             "CREATE CONSTRAINT tejido_nombre IF NOT EXISTS FOR (t:Tejido) REQUIRE t.nombre IS UNIQUE",
             "CREATE CONSTRAINT estructura_nombre IF NOT EXISTS FOR (e:Estructura) REQUIRE e.nombre IS UNIQUE",
             "CREATE CONSTRAINT tincion_nombre IF NOT EXISTS FOR (t:Tincion) REQUIRE t.nombre IS UNIQUE",
+            "CREATE CONSTRAINT tabla_id IF NOT EXISTS FOR (t:Tabla) REQUIRE t.id IS UNIQUE",
         ]
         for c in constraints:
             try:
@@ -107,7 +108,7 @@ class Neo4jClient:
 
     async def upsert_chunk(self, chunk_id: str, text: str, source: str,
                             chunk_idx: int, embedding: List[float],
-                            entities: Dict[str, List[str]]):
+                            entities: Dict[str, list]):
         await self.run("""
             MERGE (c:Chunk {id: $id})
             SET c.texto = $text, c.fuente = $source,
@@ -119,39 +120,57 @@ class Neo4jClient:
             "id": chunk_id, "text": text, "source": source,
             "chunk_idx": chunk_idx, "embedding": embedding
         })
+        # -- Tissues with SNOMED/FMA ontology normalization --
         for tissue in entities.get("tejidos", []):
+            t_name = tissue.get("nombre", tissue) if isinstance(tissue, dict) else tissue
+            snomed_id = tissue.get("snomed_id") if isinstance(tissue, dict) else None
+            fma_id = tissue.get("fma_id") if isinstance(tissue, dict) else None
             await self.run("""
                 MERGE (t:Tejido {nombre: $name})
+                SET t.snomed_id = coalesce($snomed_id, t.snomed_id),
+                    t.fma_id = coalesce($fma_id, t.fma_id)
                 WITH t MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(t)
-            """, {"name": tissue, "chunk_id": chunk_id})
+            """, {"name": t_name, "chunk_id": chunk_id,
+                  "snomed_id": snomed_id, "fma_id": fma_id})
+        # -- Structures with SNOMED normalization --
         for structure in entities.get("estructuras", []):
+            e_name = structure.get("nombre", structure) if isinstance(structure, dict) else structure
+            snomed_id = structure.get("snomed_id") if isinstance(structure, dict) else None
             await self.run("""
                 MERGE (e:Estructura {nombre: $name})
+                SET e.snomed_id = coalesce($snomed_id, e.snomed_id)
                 WITH e MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(e)
-            """, {"name": structure, "chunk_id": chunk_id})
+            """, {"name": e_name, "chunk_id": chunk_id,
+                  "snomed_id": snomed_id})
         for stain in entities.get("tinciones", []):
             await self.run("""
                 MERGE (t:Tincion {nombre: $name})
                 WITH t MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(t)
             """, {"name": stain, "chunk_id": chunk_id})
-        for tissue in entities.get("tejidos", []):
-            for structure in entities.get("estructuras", []):
+        # -- Cross-entity relations (normalizing dicts to strings) --
+        tissues_list = [t.get("nombre", t) if isinstance(t, dict) else t
+                        for t in entities.get("tejidos", [])]
+        structures_list = [e.get("nombre", e) if isinstance(e, dict) else e
+                           for e in entities.get("estructuras", [])]
+        stains_list = entities.get("tinciones", [])
+        for tissue in tissues_list:
+            for structure in structures_list:
                 await self.run("""
                     MERGE (t:Tejido {nombre: $tissue})
                     MERGE (e:Estructura {nombre: $structure})
                     MERGE (t)-[:CONTIENE]->(e)
                 """, {"tissue": tissue, "structure": structure})
-            for stain in entities.get("tinciones", []):
+            for stain in stains_list:
                 await self.run("""
                     MERGE (t:Tejido {nombre: $tissue})
                     MERGE (ti:Tincion {nombre: $stain})
                     MERGE (t)-[:TENIDA_CON]->(ti)
                 """, {"tissue": tissue, "stain": stain})
-        for structure in entities.get("estructuras", []):
-            for stain in entities.get("tinciones", []):
+        for structure in structures_list:
+            for stain in stains_list:
                 await self.run("""
                     MERGE (e:Estructura {nombre: $structure})
                     MERGE (ti:Tincion {nombre: $stain})
@@ -177,6 +196,23 @@ class Neo4jClient:
             "id": image_id, "path": path, "source": source,
             "page": page, "ocr_text": ocr_text, "page_text": page_text,
             "emb_uni": emb_uni, "emb_plip": emb_plip
+        })
+
+    async def upsert_table(self, tabla_id: str, contenido_md: str, source: str,
+                           page: int, embedding: Optional[List[float]] = None):
+        """Inserts or updates a :Tabla node with Markdown table content."""
+        await self.run("""
+            MERGE (t:Tabla {id: $id})
+            SET t.contenido_md = $contenido_md, t.fuente = $source,
+                t.pagina = $page, t.embedding = $embedding
+            WITH t
+            MERGE (pdf:PDF {nombre: $source})
+            MERGE (t)-[:PERTENECE_A]->(pdf)
+            MERGE (pag:Pagina {numero: $page, pdf_nombre: $source})
+            MERGE (t)-[:EN_PAGINA]->(pag)
+        """, {
+            "id": tabla_id, "contenido_md": contenido_md, "source": source,
+            "page": page, "embedding": embedding
         })
 
     async def create_similarity_relations(self, threshold: float = SIMILAR_IMG_THRESHOLD):
@@ -372,6 +408,18 @@ class Neo4jClient:
         if top_ids:
             res_vec = await self.expand_neighborhood(top_ids)
 
+        # ── Near-duplicate detection (UNI ∩ PLIP with score ≥ 0.95) ──
+        near_dup_ids = set()
+        if res_uni and res_plip:
+            uni_scores = {r["id"]: r["similarity"] for r in res_uni if r.get("id")}
+            plip_scores = {r["id"]: r["similarity"] for r in res_plip if r.get("id")}
+            for img_id in uni_scores:
+                if img_id in plip_scores:
+                    if uni_scores[img_id] >= 0.95 and plip_scores[img_id] >= 0.95:
+                        near_dup_ids.add(img_id)
+            if near_dup_ids:
+                print(f"   🎯 Near-duplicates detected: {near_dup_ids}")
+
         combined: Dict[str, Dict] = {}
 
         def add(results: List[Dict], weight: float):
@@ -380,6 +428,9 @@ class Neo4jClient:
                 if not r.get("text") and not r.get("image_path"):
                     continue
                 weighted_sim = r.get("similarity", 0) * weight
+                # Near-duplicate boost ×2.0
+                if r.get("id") in near_dup_ids:
+                    weighted_sim *= 2.0
                 if key not in combined:
                     combined[key] = {**r, "similarity": weighted_sim}
                 else:
@@ -394,6 +445,7 @@ class Neo4jClient:
         final = sorted(combined.values(), key=lambda x: x["similarity"], reverse=True)
 
         print(f"   📊 Hybrid Search: Txt={len(res_text)} | "
-              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
+              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}"
+              + (f" | 🎯 NearDup={len(near_dup_ids)}" if near_dup_ids else ""))
 
         return final[:15]
