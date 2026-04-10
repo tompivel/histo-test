@@ -127,6 +127,10 @@ ANCLAS_SEMANTICAS_HISTOLOGIA = [
     "clasificar célula estructura histológica",
     "tumor quiste folículo cuerpo lúteo albicans",
     "corte histológico preparación muestra lámina",
+    "tejido epitelial simple cilíndrico estratificado pseudoestratificado",
+    "tejido conectivo laxo denso adiposo cartilaginoso óseo",
+    "tejido muscular liso estriado cardíaco esquelético",
+    "tejido nervioso neurona glía axón dendrita",
 ]
 
 def _safe(value, default: str = "") -> str:
@@ -472,12 +476,14 @@ class Neo4jClient:
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str, texto_pagina: str,
-                             emb_uni: List[float], emb_plip: List[float]):
+                             emb_uni: List[float], emb_plip: List[float],
+                             caption: str = ""):
         await self.run("""
             MERGE (i:Imagen {id: $id})
             SET i.path = $path, i.fuente = $fuente,
                 i.pagina = $pagina, i.ocr_text = $ocr_text,
                 i.texto_pagina = $texto_pagina,
+                i.caption = $caption,
                 i.embedding_uni = $emb_uni,
                 i.embedding_plip = $emb_plip
             WITH i
@@ -488,6 +494,7 @@ class Neo4jClient:
         """, {
             "id": imagen_id, "path": path, "fuente": fuente,
             "pagina": pagina, "ocr_text": ocr_text, "texto_pagina": texto_pagina,
+            "caption": caption,
             "emb_uni": emb_uni, "emb_plip": emb_plip
         })
 
@@ -533,7 +540,11 @@ class Neo4jClient:
                 CALL db.index.vector.queryNodes($index, $k, $emb)
                 YIELD node AS i, score
                 RETURN i.id AS id, 
-                       coalesce(i.texto_pagina, i.ocr_text) AS texto, 
+                       coalesce(
+                           CASE WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption END,
+                           CASE WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text END,
+                           i.texto_pagina
+                       ) AS texto, 
                        i.fuente AS fuente,
                        'imagen' AS tipo, i.path AS imagen_path, score AS similitud
                 ORDER BY similitud DESC
@@ -608,8 +619,9 @@ class Neo4jClient:
             OPTIONAL MATCH (n)-[:SIMILAR_A]-(vecino_similar:Imagen)
             WITH n, nid, list_pdf, list_ent, collect(DISTINCT vecino_similar)[..5] AS list_sim
 
-            // Expansión 4: imágenes de la misma página que el chunk
-            OPTIONAL MATCH (n)-[:PERTENECE_A]->(pdf2:PDF)<-[:PERTENECE_A]-(img_pag:Imagen)
+            // Expansión 4: imágenes de la misma página (Fix #4)
+            OPTIONAL MATCH (n)-[:EN_PAGINA]->(pag:Pagina)<-[:EN_PAGINA]-(img_pag:Imagen)
+            WHERE img_pag.id <> nid
             WITH n, nid, list_pdf, list_ent, list_sim, collect(DISTINCT img_pag)[..5] AS list_pag
 
             WITH n, $ids AS ids_originales,
@@ -623,7 +635,11 @@ class Neo4jClient:
             RETURN DISTINCT
                 v.id AS id,
                 CASE 
-                    WHEN v:Imagen THEN coalesce(v.texto_pagina, v.ocr_text, '') 
+                    WHEN v:Imagen THEN coalesce(
+                        CASE WHEN v.caption IS NOT NULL AND v.caption <> '' THEN v.caption END,
+                        CASE WHEN v.ocr_text IS NOT NULL AND v.ocr_text <> '' THEN v.ocr_text END,
+                        v.texto_pagina, ''
+                    )
                     ELSE coalesce(v.texto, '') 
                 END AS texto,
                 v.fuente AS fuente,
@@ -709,11 +725,18 @@ class Neo4jClient:
                 else:
                     combined[key]["similitud"] += sim_ponderada
 
-        # Pesos ajustados
-        agregar(res_texto, 0.80) # Texto sigue siendo fundamental
-        agregar(res_uni,   0.50) # UNI complemento visual
-        agregar(res_plip,  0.50) # PLIP complemento visual
-        agregar(res_ent,   0.60) # Entidades (¡Crucial para discriminar órganos!)
+        # Pesos dinámicos según modo de consulta (Fix #5)
+        tiene_imagen = imagen_embedding_uni is not None or imagen_embedding_plip is not None
+        if tiene_imagen:
+            agregar(res_texto, 0.40)  # Texto complementa cuando hay imagen
+            agregar(res_uni,   0.70)  # UNI domina visual
+            agregar(res_plip,  0.70)  # PLIP domina visual
+            agregar(res_ent,   0.60)  # Entidades siempre importantes
+        else:
+            agregar(res_texto, 0.80)  # Texto domina sin imagen
+            agregar(res_uni,   0.20)  # UNI poco relevante sin query visual
+            agregar(res_plip,  0.20)  # PLIP poco relevante sin query visual
+            agregar(res_ent,   0.60)  # Entidades siempre importantes
         agregar(res_vec,   0.20)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
@@ -917,33 +940,62 @@ class SemanticMemory:
 class ClasificadorSemantico:
     """
     Determina si una consulta pertenece al dominio histológico combinando:
-      1. Similitud coseno entre embedding ImageBind de la consulta y anclas semánticas.
+      1. Similitud coseno contra la ontología extraída del contenido (temario).
+         Fallback a anclas semánticas hardcodeadas si el temario está vacío.
       2. Razonamiento LLM con contexto de imagen disponible.
     """
 
-    UMBRAL_SIMILITUD = 0.49
+    UMBRAL_SIMILITUD = 0.45
     UMBRAL_LLM       = 0.49
 
-
     def __init__(self, llm, embeddings, device: str, temario: List[str]):
-        self.llm       = llm
+        self.llm        = llm
         self.embeddings = embeddings
-        self.device    = device
-        self.temario   = temario
+        self.device     = device
+        self._temario: List[str]              = temario
         self._anclas_emb: Optional[np.ndarray] = None
+        self._temario_emb: Optional[np.ndarray] = None
+
+    @property
+    def temario(self) -> List[str]:
+        return self._temario
+
+    @temario.setter
+    def temario(self, value: List[str]):
+        self._temario = value
+        self._temario_emb = None  # Invalidar cache al actualizar ontología
+        print(f"   🔄 Ontología actualizada ({len(value)} temas) — cache de embeddings invalidado")
 
     def _embed_textos(self, textos: List[str]) -> np.ndarray:
         return np.array(embed_documents_con_reintento(self.embeddings, textos))
 
     def _get_anclas_emb(self) -> np.ndarray:
+        """Embeddings de anclas hardcodeadas (fallback cuando no hay temario)."""
         if self._anclas_emb is None:
-            print("   🔄 Precalculando embeddings de anclas semánticas (Gemini)...")
+            print("   🔄 Precalculando embeddings de anclas semánticas (fallback)...")
             self._anclas_emb = self._embed_textos(ANCLAS_SEMANTICAS_HISTOLOGIA)
         return self._anclas_emb
+
+    def _get_temario_emb(self) -> Optional[np.ndarray]:
+        """Embeddings de la ontología real extraída del contenido."""
+        if not self._temario:
+            return None
+        if self._temario_emb is None:
+            print(f"   🔄 Precalculando embeddings de ontología ({len(self._temario)} temas)...")
+            self._temario_emb = self._embed_textos(self._temario)
+        return self._temario_emb
 
     def similitud_con_dominio(self, consulta: str) -> float:
         try:
             q_emb = np.array(embed_query_con_reintento(self.embeddings, consulta))
+
+            # Priorizar ontología extraída del contenido real
+            temario_emb = self._get_temario_emb()
+            if temario_emb is not None and len(temario_emb) > 0:
+                sims = (q_emb @ temario_emb.T).flatten()
+                return float(np.max(sims))
+
+            # Fallback a anclas hardcodeadas (solo antes de indexar)
             a_emb = self._get_anclas_emb()
             sims  = (q_emb @ a_emb.T).flatten()
             return float(np.max(sims))
@@ -1011,7 +1063,7 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
             confianza = float(data.get("confianza", 0.49))
             valido    = bool(data.get("valido", True))
 
-            if not valido and imagen_activa and confianza < 0.7:
+            if not valido and imagen_activa:
                 valido = True
                 data["motivo"] += " [aceptado por imagen activa]"
 
@@ -1045,6 +1097,44 @@ class ExtractorImagenesPDF:
         self.directorio_salida = directorio_salida
         os.makedirs(directorio_salida, exist_ok=True)
 
+    @staticmethod
+    def extraer_caption_imagen(page_fitz, img_bbox, texto_pagina_completo: str) -> str:
+        """Extrae el texto más cercano espacialmente a la imagen (caption).
+        Busca primero debajo (caption típico), luego arriba.
+        También busca referencias 'Fig. X' / 'Imagen X' en el texto."""
+        caption = ""
+        try:
+            # Área de búsqueda: debajo de la imagen (hasta 80 puntos)
+            area_abajo = fitz.Rect(
+                img_bbox[0], img_bbox[3],
+                img_bbox[2], img_bbox[3] + 80
+            )
+            caption = page_fitz.get_text("text", clip=area_abajo).strip()
+            if not caption:
+                # Buscar arriba de la imagen (hasta 60 puntos)
+                area_arriba = fitz.Rect(
+                    img_bbox[0], max(0, img_bbox[1] - 60),
+                    img_bbox[2], img_bbox[1]
+                )
+                caption = page_fitz.get_text("text", clip=area_arriba).strip()
+        except Exception:
+            pass
+        # Buscar referencias "Fig. X" / "Imagen X" en el texto
+        referencias = re.findall(
+            r'(?:Fig(?:ura)?\.?\s*\d+[A-Za-z]?[^.]*\.)|(?:Imagen\s+\d+[\.\d]*[^.]*\.)',
+            texto_pagina_completo,
+            re.IGNORECASE
+        )
+        partes = []
+        if caption:
+            partes.append(caption)
+        if referencias:
+            partes.extend(referencias[:3])
+        if partes:
+            return "\n".join(partes)
+        # Fallback: primeros 500 chars del texto de la página
+        return texto_pagina_completo[:500] if texto_pagina_completo else ""
+
     def extraer_de_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
         imagenes_extraidas = []
         nombre_pdf = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -1055,21 +1145,13 @@ class ExtractorImagenesPDF:
             return []
 
         def _texto_pagina_con_contexto(doc, idx_0based: int) -> str:
-            """Devuelve texto de la página actual + página siguiente (si existe).
-            Esto evita que la imagen de pág N pierda el contexto/caption de pág N+1."""
-            partes = []
+            """Devuelve texto SOLO de la página actual.
+            El caption se extrae por proximidad espacial (bbox),
+            no por concatenación de páginas adyacentes."""
             try:
-                partes.append(doc[idx_0based].get_text().strip())
+                return doc[idx_0based].get_text().strip()
             except Exception:
-                pass
-            if idx_0based + 1 < len(doc):
-                try:
-                    siguiente = doc[idx_0based + 1].get_text().strip()
-                    if siguiente:
-                        partes.append(siguiente)
-                except Exception:
-                    pass
-            return "\n".join(partes)
+                return ""
 
         for num_pagina, pagina in enumerate(doc, start=1):
             idx_0 = num_pagina - 1  # índice base-0 para acceder a doc[idx]
@@ -1078,7 +1160,9 @@ class ExtractorImagenesPDF:
             # Método preciso: solo imágenes realmente dibujadas en esta página
             try:
                 img_info_list = pagina.get_image_info(xrefs=True)
-                page_xrefs = [info["xref"] for info in img_info_list if info.get("xref")]
+                # Mapear xref -> bbox para extracción de caption (Fix #1)
+                xref_to_bbox = {info["xref"]: info.get("bbox") for info in img_info_list if info.get("xref")}
+                page_xrefs = list(xref_to_bbox.keys())
                 
                 if page_xrefs:
                     for xref in page_xrefs:
@@ -1094,7 +1178,8 @@ class ExtractorImagenesPDF:
                             if w >= self.MIN_WIDTH and h >= self.MIN_HEIGHT:
                                 valid_images_this_page.append({
                                     "pil": pil_temp,
-                                    "area": w * h
+                                    "area": w * h,
+                                    "bbox": xref_to_bbox.get(xref)
                                 })
                         except Exception:
                             continue
@@ -1105,6 +1190,7 @@ class ExtractorImagenesPDF:
                 # Seleccionar la imagen más grande (histológica)
                 mejor = max(valid_images_this_page, key=lambda x: x["area"])
                 pil_img = mejor["pil"]
+                img_bbox = mejor.get("bbox")
                 nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.png"
                 ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
                 
@@ -1116,11 +1202,16 @@ class ExtractorImagenesPDF:
                         ocr_text = ""
                     
                     texto_completo_pagina = _texto_pagina_con_contexto(doc, idx_0)
+                    # Extraer caption por proximidad espacial (Fix #1)
+                    caption = ""
+                    if img_bbox:
+                        caption = self.extraer_caption_imagen(pagina, img_bbox, texto_completo_pagina)
 
                     imagenes_extraidas.append({
                         "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
                         "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
-                        "texto_pagina": texto_completo_pagina
+                        "texto_pagina": texto_completo_pagina,
+                        "caption": caption
                     })
                 except Exception as e:
                     print(f"  ⚠️ Error guardando pág {num_pagina}: {e}")
@@ -1141,11 +1232,18 @@ class ExtractorImagenesPDF:
                             ocr_text = ""
 
                         texto_completo_pagina = _texto_pagina_con_contexto(doc, idx_0)
-                        
+                        # Fallback: sin bbox, buscar solo refs "Fig./Imagen"
+                        refs = re.findall(
+                            r'(?:Fig(?:ura)?\.?\s*\d+[A-Za-z]?[^.]*\.)|(?:Imagen\s+\d+[\.\d]*[^.]*\.)',
+                            texto_completo_pagina, re.IGNORECASE
+                        )
+                        caption_fb = "\n".join(refs[:3]) if refs else ""
+
                         imagenes_extraidas.append({
                             "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
                             "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
-                            "texto_pagina": texto_completo_pagina
+                            "texto_pagina": texto_completo_pagina,
+                            "caption": caption_fb
                         })
                 except Exception as e:
                     print(f"  ⚠️ Fallback error pág {num_pagina}: {e}")
@@ -1285,6 +1383,7 @@ class AgentState(TypedDict):
     tema_valido:                 bool
     tema_encontrado:             Optional[str]
     imagenes_recuperadas:        List[str]
+    imagenes_texto_map:          Dict[str, str]   # path -> texto descriptivo del manual
     analisis_comparativo:        Optional[str]
     estructura_identificada:     Optional[str]
     similitud_semantica_dominio: float
@@ -1432,7 +1531,7 @@ class AsistenteHistologiaNeo4j:
         self.graph = g
 
     def _route_por_temario(self, state: AgentState) -> str:
-        return "en_temario" if state.get("tema_valido", True) else "fuera_temario"
+        return "en_temario"
 
     # ------------------------------------------------------------------
     # Nodos
@@ -1724,19 +1823,35 @@ class AsistenteHistologiaNeo4j:
     async def _nodo_filtrar_contexto(self, state: AgentState) -> AgentState:
         t0     = time.time()
         umbral = self.SIMILARITY_THRESHOLD
-        validos = [r for r in state["resultados_busqueda"] if r.get("similitud", 0) >= umbral]
+        validos = []
+        for r in state["resultados_busqueda"]:
+            current_sim = r.get("similitud", 0)
+            if r.get("tipo") == "texto" and current_sim < 0.6:
+                continue
+            if r.get("tipo") == "imagen" and current_sim < umbral:
+                continue
+
+            # Si es imagen pero no existe el archivo en disco, lo rechazamos
+            if r.get("tipo") == "imagen":
+                img_p = r.get("imagen_path")
+                if not img_p or not os.path.exists(img_p):
+                    continue
+            validos.append(r)
 
         state["resultados_validos"]  = validos
         state["contexto_suficiente"] = len(validos) > 0
 
         vistas: set = set()
         imagenes_unicas: List[str] = []
+        imagenes_texto: Dict[str, str] = {}
         for r in validos:
             img_path = r.get("imagen_path")
             if img_path and os.path.exists(img_path) and img_path not in vistas:
                 vistas.add(img_path)
                 imagenes_unicas.append(img_path)
+                imagenes_texto[img_path] = _safe(r.get('texto', ''))[:500]
         state["imagenes_recuperadas"] = imagenes_unicas
+        state["imagenes_texto_map"]   = imagenes_texto
 
         if validos:
             validos_sorted = sorted(validos, key=lambda x: x.get("similitud", 0), reverse=True)
@@ -1810,9 +1925,12 @@ class AsistenteHistologiaNeo4j:
                 f"\nAnálisis previo:\n{analisis_previo[:600]}\n"
             )})
 
+        imagenes_texto = state.get("imagenes_texto_map", {})
         for i, ref_path in enumerate(imagenes_ref, 1):
+            texto_ref = imagenes_texto.get(ref_path, "Sin descripción disponible")
             content_parts.append({"type": "text", "text": (
-                f"\n=== REFERENCIA #{i} ({os.path.basename(ref_path)}) ==="
+                f"\n=== REFERENCIA #{i} ({os.path.basename(ref_path)}) ===\n"
+                f"DESCRIPCIÓN DEL MANUAL: {texto_ref}"
             )})
             try:
                 with open(ref_path, "rb") as f:
@@ -1830,9 +1948,12 @@ class AsistenteHistologiaNeo4j:
         content_parts.append({"type": "text", "text": (
             "\n=== INSTRUCCIONES ESTRICTAS ===\n"
             f"Compara rigurosamente basándote en:\n{features_lista}\n\n"
-            "TU ROL ES SER UN JUEZ ESCÉPTICO. Tu objetivo principal es encontrar las DIFERENCIAS que demuestren que NO son el mismo tejido.\n\n"
+            "IMPORTANTE: Cada referencia incluye la DESCRIPCIÓN DEL MANUAL. "
+            "Usa esa descripción como fuente de verdad para identificar la estructura, "
+            "NO tu propia interpretación visual.\n\n"
+            "TU ROL ES SER UN EVALUADOR OBJETIVO. Tu objetivo principal es determinar verdaderamente si la imagen de consulta y las referencias muestran la misma estructura histológica.\n\n"
             "1. TABLA COMPARATIVA (Markdown): | Feature | Consulta | Ref#1 | Ref#2 |\n"
-            "2. VEREDICTO DE IDENTIDAD: Si la imagen de consulta parece ser un órgano distinto al de las referencias, DEBES declarar EXPLÍCITAMENTE que son TEJIDOS DIFERENTES, sin importar su parecido visual por la tinción.\n"
+            "2. VEREDICTO DE IDENTIDAD: Evalúa las similitudes morfológicas y declara si son el MISMO TEJIDO o TEJIDOS DIFERENTES.\n"
             "3. CONCLUSIÓN FINAL: ¿Son la misma estructura biológica? (SÍ/NO). Si es NO, indica qué crees que es realmente la imagen de la consulta."
         )})
 
@@ -1871,8 +1992,20 @@ class AsistenteHistologiaNeo4j:
         print("💭 Generando respuesta v4.1...")
 
         if not state["contexto_suficiente"]:
-            print("   ⚠️ Sin contexto RAG — aplicando rechazo estricto")
-            state["respuesta_final"] = "**Esta información no se encuentra en la base de datos.**"
+            print("   ⚠️ Sin contexto RAG — aplicando rechazo estricto (fuera de dominio)")
+            temario = state.get("temario") or []
+            muestra = "\n".join(f"  • {t}" for t in temario[:20])
+            if len(temario) > 20:
+                muestra += f"\n  ... y {len(temario)-20} más"
+            state["respuesta_final"] = (
+                "⚠️ **Consulta fuera del dominio disponible**\n\n"
+                "Tu consulta no parece estar relacionada con histología, patología "
+                "o morfología tisular/celular.\n\n"
+                f"**Temas disponibles (muestra):**\n{muestra}\n\n"
+                "Si tenés una imagen histológica, subila y reformulá tu pregunta. "
+                "Ejemplos válidos: '¿qué tipo de tejido es este?', "
+                "'describe la estructura observada', 'diagnóstico diferencial'."
+            )
             state["trayectoria"].append({
                 "nodo": "GenerarRespuesta", "contexto_suficiente": False,
                 "tiempo": round(time.time()-t0, 2)
@@ -1885,17 +2018,27 @@ class AsistenteHistologiaNeo4j:
             if tiene_comparativo else ""
         )
 
+        regla_validacion = (
+            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si y sólo si la conclusión de ese análisis afirma enfáticamente que son TEJIDOS DIFERENTES, debes decir EXACTAMENTE: 'no esta en base de datos: [Manual: No disponible] | [Imagen: NUEVA IMAGEN DEL USUARIO]' y no escribir nada más. De lo contrario, asume que coinciden y continúa con el paso 3 detallando el tejido.\n"
+            if state.get("tiene_imagen") else
+            "2. VALIDACIÓN: Si la información solicitada no existe en el texto del manual, indica que no está en la base de datos.\n"
+        )
+
         system_prompt = (
             "Eres un asistente de histología. Responde SOLO con el contenido del manual o la imagen visible en el chat.\n\n"
-            "REGLAS:\n"
-            "1. Solo información de SECCIONES DEL MANUAL e IMÁGENES DE REFERENCIA guardadas en la base de datos, o la propia imagen que subió el usuario.\n"
+            "REGLAS FUNDAMENTALES:\n"
+            "1. PRIORIDAD ABSOLUTA: La DESCRIPCIÓN TEXTUAL DEL MANUAL es la fuente de verdad. "
+               "Si el texto del manual dice 'Tejido nervioso corteza cerebelosa', ESO es lo correcto, "
+               "sin importar tu propia interpretación visual de la imagen.\n"
             "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
-            "3. REGLA DE ORO: Para cada 'IMAGEN DE REFERENCIA' recuperada, DEBES indicar el nombre del archivo (ej: img_cerebro_1.png) y explicar a qué estructura o tejido corresponde según el texto del manual que la acompaña en el contexto.\n"
-            "4. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+            "3. Para cada 'IMAGEN DE REFERENCIA', indica el nombre y la descripción textual del manual.\n"
+            "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
+               "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
+            "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
             "ESTRUCTURA:\n"
             "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
-            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si concluye que la imagen del usuario NO ES LA MISMA ESTRUCTURA que las imágenes de referencia del manual, debes informar al usuario: 'Tu imagen parece ser X, pero el manual solo contiene información sobre Y, por lo que no puedo ayudarte con el manual.' y DETENTE AHÍ.\n"
-            "3. Características histológicas según la base de datos (SOLO si las estructuras coinciden)\n"
+            f"{regla_validacion}"
+            "3. Características histológicas según la base de datos (SOLO lo que dice el texto del manual)\n"
             "4. Conclusión y confianza"
             f"{nota_comp}"
         )
@@ -2107,7 +2250,8 @@ class AsistenteHistologiaNeo4j:
                     ocr_text=img_info.get("ocr_text", ""),
                     texto_pagina=img_info.get("texto_pagina", ""),
                     emb_uni=emb_u.tolist(),
-                    emb_plip=emb_p.tolist()
+                    emb_plip=emb_p.tolist(),
+                    caption=img_info.get("caption", "")
                 )
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
@@ -2168,6 +2312,7 @@ class AsistenteHistologiaNeo4j:
             analisis_visual=None, tiene_imagen=False, imagen_es_nueva=False,
             contexto_suficiente=False, temario=self.extractor_temario.temas,
             tema_valido=True, tema_encontrado=None, imagenes_recuperadas=[],
+            imagenes_texto_map={},
             analisis_comparativo=None, estructura_identificada=None,
             similitud_semantica_dominio=0.0, confianza_baja=False,
         )
