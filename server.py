@@ -62,6 +62,7 @@ class ChatResponse(BaseModel):
     imagenes_recuperadas: list = []
     trayectoria: list = []
     imagen_activa: Optional[str] = None
+    mostrar_imagenes: bool = False
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
@@ -119,6 +120,9 @@ app.add_middleware(
 
 # Archivos estáticos del cliente
 CLIENT_DIR = Path(__file__).parent / "client"
+
+# Directorio de imágenes extraídas (para servir al frontend)
+IMAGENES_DIR = Path(__file__).parent / "imagenes_extraidas"
 
 
 def _check_ready():
@@ -202,18 +206,20 @@ async def post_chat(req: ChatRequest):
             imagen_path=imagen_path,
         )
 
-        # Leer trayectoria
+        # Leer resultado directo del asistente (más confiable que el archivo JSON)
+        resultado_directo = getattr(asistente, '_ultimo_resultado', {})
+        mostrar_imgs = resultado_directo.get("mostrar_imagenes", False)
+        imagenes_rec_directas = resultado_directo.get("imagenes_recuperadas", [])
+        estructura = resultado_directo.get("estructura_identificada")
+
+        # Leer trayectoria del archivo (solo para metadata de debug)
         trayectoria = []
-        estructura = None
-        imagenes_rec = []
         trayectoria_file = Path(__file__).parent / "trayectoria_neo4j.json"
         if trayectoria_file.exists():
             try:
                 with open(trayectoria_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 trayectoria = data.get("trayectoria", [])
-                estructura = data.get("estructura_identificada")
-                imagenes_rec = data.get("imagenes_recuperadas", [])
             except Exception:
                 pass
 
@@ -224,9 +230,10 @@ async def post_chat(req: ChatRequest):
         return ChatResponse(
             respuesta=respuesta,
             estructura_identificada=estructura,
-            imagenes_recuperadas=[os.path.basename(p) for p in imagenes_rec],
+            imagenes_recuperadas=[os.path.basename(p) for p in imagenes_rec_directas],
             trayectoria=trayectoria,
             imagen_activa=img_activa,
+            mostrar_imagenes=mostrar_imgs,
         )
 
     except Exception as e:
@@ -245,6 +252,11 @@ async def limpiar_imagen():
     if asistente.memoria:
         asistente.memoria.set_imagen(None)
     return {"ok": True, "mensaje": "Imagen activa eliminada"}
+
+
+# ── Ruta estática: imágenes extraídas ────────────────────────────────
+if IMAGENES_DIR.exists():
+    app.mount("/imagenes_extraidas", StaticFiles(directory=str(IMAGENES_DIR)), name="imagenes_extraidas")
 
 
 # ── Main ─────────────────────────────────────────────────────────────

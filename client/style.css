@@ -716,6 +716,48 @@ body {
 .a2ui-text-body { font-size: 0.9rem; color: var(--text-secondary); line-height: 1.6; }
 .a2ui-divider { height: 1px; background: var(--border-glass); margin: 0.25rem 0; }
 
+/* ── Retrieved images in responses ──────────────────────────────────── */
+.retrieved-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border-glass);
+}
+
+.retrieved-image-figure {
+    flex: 0 0 auto;
+    max-width: 280px;
+    text-align: center;
+    cursor: pointer;
+    transition: transform var(--transition);
+}
+
+.retrieved-image-figure:hover {
+    transform: scale(1.02);
+}
+
+.retrieved-image {
+    max-width: 100%;
+    max-height: 220px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border-glass);
+    box-shadow: var(--shadow-sm);
+    transition: border-color var(--transition);
+}
+
+.retrieved-image:hover {
+    border-color: var(--primary);
+}
+
+.retrieved-image-figure figcaption {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-top: 0.35rem;
+    word-break: break-word;
+}
+
 /* ── Animations ────────────────────────────────────────────────────── */
 @keyframes fadeIn {
     from { opacity: 0; }

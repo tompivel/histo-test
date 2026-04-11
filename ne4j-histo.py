@@ -681,6 +681,86 @@ class Neo4jClient:
             print(f"⚠️ Error búsqueda camino: {e}")
             return []
 
+    async def busqueda_imagenes_por_texto(self, entidades: Dict[str, List[str]], 
+                                          top_k: int = 5) -> List[Dict]:
+        """Busca nodos :Imagen relacionados con las entidades, buscando en texto de página,
+        OCR, caption, y también imágenes en las mismas páginas que chunks relevantes.
+        Tolerante a tildes/acentos."""
+        tejidos = entidades.get("tejidos", [])
+        estructuras = entidades.get("estructuras", [])
+        consulta_palabras = entidades.get("_consulta", [])
+        terminos = tejidos + estructuras + consulta_palabras
+        if not terminos:
+            return []
+        
+        # Generar variantes sin tildes para cada término
+        import unicodedata
+        def sin_tildes(s):
+            return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+        
+        terminos_expandidos = []
+        for t in terminos:
+            terminos_expandidos.append(t.lower())
+            st = sin_tildes(t.lower())
+            if st != t.lower():
+                terminos_expandidos.append(st)
+        terminos_expandidos = list(set(terminos_expandidos))
+        
+        # Búsqueda con CONTAINS tolerante a tildes
+        query = """
+            MATCH (i:Imagen)
+            WHERE i.path IS NOT NULL
+            AND ANY(t IN $terminos WHERE 
+                toLower(coalesce(i.texto_pagina,'')) CONTAINS t OR
+                toLower(coalesce(i.ocr_text,'')) CONTAINS t OR
+                toLower(coalesce(i.caption,'')) CONTAINS t
+            )
+            RETURN i.id AS id,
+                   coalesce(i.caption, i.ocr_text, i.texto_pagina) AS texto,
+                   i.fuente AS fuente,
+                   'imagen' AS tipo,
+                   i.path AS imagen_path,
+                   0.5 AS similitud
+            LIMIT $top_k
+        """
+        
+        try:
+            resultados = await self.run(query, {"terminos": terminos_expandidos, "top_k": top_k})
+            if resultados:
+                print(f"   🖼️ {len(resultados)} imágenes encontradas (búsqueda directa)")
+                return resultados
+        except Exception as e:
+            print(f"⚠️ Error búsqueda imágenes por texto: {e}")
+        
+        # Fallback: buscar imágenes en páginas de chunks que mencionan las entidades
+        query_chunks = """
+            MATCH (c:Chunk)
+            WHERE ANY(t IN $terminos WHERE toLower(c.texto) CONTAINS t)
+            WITH DISTINCT c.fuente AS fuente_pdf
+            MATCH (i:Imagen {fuente: fuente_pdf})
+            WHERE i.path IS NOT NULL
+            AND ANY(t IN $terminos WHERE 
+                toLower(coalesce(i.texto_pagina,'')) CONTAINS t OR
+                toLower(coalesce(i.ocr_text,'')) CONTAINS t OR
+                toLower(coalesce(i.caption,'')) CONTAINS t
+            )
+            RETURN DISTINCT i.id AS id,
+                   coalesce(i.caption, i.ocr_text, i.texto_pagina) AS texto,
+                   i.fuente AS fuente,
+                   'imagen' AS tipo,
+                   i.path AS imagen_path,
+                   0.45 AS similitud
+            LIMIT $top_k
+        """
+        try:
+            resultados = await self.run(query_chunks, {"terminos": terminos_expandidos, "top_k": top_k})
+            if resultados:
+                print(f"   🖼️ {len(resultados)} imágenes encontradas (por chunks)")
+            return resultados
+        except Exception as e:
+            print(f"⚠️ Error búsqueda imágenes por chunks: {e}")
+            return []
+
     async def busqueda_hibrida(self,
                                 texto_embedding: Optional[List[float]],
                                 imagen_embedding_uni: Optional[List[float]],
@@ -933,6 +1013,19 @@ class SemanticMemory:
             ctx += (f"\n\n[Imagen activa en el chat: "
                     f"{os.path.basename(self.imagen_activa_path)}]")
         return ctx
+
+    def get_history_for_prompt(self, max_turns: int = 5) -> str:
+        """Retorna los últimos max_turns intercambios formateados para inyectar en el system prompt."""
+        recent = self.conversations[-max_turns:]
+        if not recent:
+            return ""
+        lines = []
+        for conv in recent:
+            lines.append(f"Usuario: {conv['query']}")
+            resp = conv['response']
+            resp_truncada = resp[:200] + "..." if len(resp) > 200 else resp
+            lines.append(f"Asistente: {resp_truncada}")
+        return "\n".join(lines)
 
 
 # =============================================================================
@@ -1390,6 +1483,8 @@ class AgentState(TypedDict):
     estructura_identificada:     Optional[str]
     similitud_semantica_dominio: float
     confianza_baja:              bool
+    mostrar_imagenes:            bool
+    historial_conversacional:    str
 
 
 # =============================================================================
@@ -1544,40 +1639,110 @@ class AsistenteHistologiaNeo4j:
 
         self.graph = g
 
+    # ------------------------------------------------------------------
+    # Detección y reescritura
+    # ------------------------------------------------------------------
+
+    def _detectar_solicitud_imagen(self, consulta: str) -> bool:
+        """Deshabilitado — foco en respuestas de texto."""
+        return False
+
+    async def _reescribir_consulta_con_contexto(self, consulta: str, historial: str) -> str:
+        """Reescribe la consulta resolviendo referencias anafóricas usando el historial.
+        Usa el LLM para detectar si hay referencias y reescribir."""
+        if not historial:
+            return consulta
+        try:
+            # Paso 1: Detectar si necesita reescritura
+            resp_check = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=(
+                    "Determiná si la consulta del usuario hace referencia a temas de la "
+                    "conversación previa (usa pronombres como 'eso', 'esto', o pide 'más sobre' "
+                    "algo mencionado antes). Respondé SOLO con 'SI' o 'NO'."
+                )),
+                HumanMessage(content=f"HISTORIAL:\n{historial}\n\nCONSULTA: {consulta}")
+            ])
+            necesita = "SI" in resp_check.content.strip().upper() or "SÍ" in resp_check.content.strip().upper()
+            if not necesita:
+                return consulta
+            
+            # Paso 2: Reescribir
+            resp = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=(
+                    "Reescribí la siguiente consulta del usuario para que sea autocontenida, "
+                    "resolviendo cualquier referencia a temas previos usando el historial. "
+                    "Devolvé SOLO la consulta reescrita, sin explicaciones."
+                )),
+                HumanMessage(content=f"HISTORIAL:\n{historial}\n\nCONSULTA ACTUAL: {consulta}")
+            ])
+            reescrita = resp.content.strip()
+            if reescrita:
+                print(f"   🔄 Consulta reescrita: '{consulta}' → '{reescrita}'")
+                return reescrita
+            return consulta
+        except Exception as e:
+            print(f"   ⚠️ Error reescribiendo consulta: {e}")
+            return consulta
+
     def _route_por_modo(self, state: AgentState) -> str:
-        """Decide si procesar imagen o ir directo a clasificar (texto puro)."""
+        """Decide si procesar imagen o ir directo a clasificar (texto puro).
+        Usa el LLM como orquestador cuando hay imagen en memoria."""
         imagen_path = state.get("imagen_path")
         tiene_imagen_nueva = imagen_path and os.path.exists(imagen_path)
         tiene_imagen_memoria = self.memoria and self.memoria.tiene_imagen_previa()
         
-        # Detectar si la consulta hace referencia explícita a una imagen
-        consulta_texto = state.get("consulta_texto", "").lower()
-        palabras_referencia_imagen = [
-            "imagen", "foto", "esta", "esto", "este", "esa", "eso", "ese",
-            "la imagen", "la foto", "qué es esto", "qué es esta", "qué tipo",
-            "identifica", "analiza", "describe", "observa", "muestra",
-            "se ve", "veo", "aparece", "presenta"
-        ]
-        hace_referencia_imagen = any(palabra in consulta_texto for palabra in palabras_referencia_imagen)
+        hace_referencia_imagen = False
         
-        # Lógica de routing:
-        # 1. Si hay imagen nueva → siempre modo con_imagen
-        # 2. Si hay imagen en memoria Y la consulta hace referencia → modo con_imagen
-        # 3. Si hay imagen en memoria pero la consulta NO hace referencia → modo solo_texto
-        # 4. Si no hay imagen → modo solo_texto
-        
+        # Si hay imagen nueva, siempre modo multimodal (no necesita LLM)
         if tiene_imagen_nueva:
             modo = "con_imagen"
+            hace_referencia_imagen = True
             print("🖼️ Modo multimodal detectado (imagen nueva)")
-        elif tiene_imagen_memoria and hace_referencia_imagen:
-            modo = "con_imagen"
-            print("🖼️ Modo multimodal detectado (imagen en memoria + referencia en consulta)")
+        elif tiene_imagen_memoria:
+            # Usar LLM para decidir si la consulta hace referencia a la imagen
+            consulta = state.get("consulta_texto", "")
+            try:
+                resp = invoke_con_reintento_sync(self.llm, [
+                    SystemMessage(content=(
+                        "Sos un clasificador estricto. El usuario tiene una imagen histológica "
+                        "subida previamente en el chat. Determiná si su consulta ACTUAL necesita "
+                        "analizar esa imagen, o si es una pregunta teórica que NO requiere la imagen.\n\n"
+                        "REGLA PRINCIPAL: En caso de duda, respondé TEXTO. Solo respondé IMAGEN "
+                        "si la consulta CLARAMENTE necesita ver/analizar la imagen subida.\n\n"
+                        "Respondé SOLO con 'IMAGEN' o 'TEXTO'.\n\n"
+                        "IMAGEN (necesita la imagen subida):\n"
+                        "- 'qué es esto?' → IMAGEN\n"
+                        "- 'describí lo que ves' → IMAGEN\n"
+                        "- 'analizá la muestra' → IMAGEN\n"
+                        "- 'qué se observa en la imagen?' → IMAGEN\n"
+                        "- 'qué tejido es el de la foto?' → IMAGEN\n\n"
+                        "TEXTO (pregunta teórica, NO necesita la imagen):\n"
+                        "- 'qué es el tejido epitelial?' → TEXTO\n"
+                        "- 'explicame la sarcomera' → TEXTO\n"
+                        "- 'cuáles son los tipos de tejido conectivo?' → TEXTO\n"
+                        "- 'qué es el tejido muscular estriado?' → TEXTO\n"
+                        "- 'mostrame una imagen de cartílago' → TEXTO\n"
+                        "- 'qué características tiene el tejido óseo?' → TEXTO\n"
+                        "- 'hablame del tejido nervioso' → TEXTO"
+                    )),
+                    HumanMessage(content=f"CONSULTA: {consulta}")
+                ])
+                resultado = resp.content.strip().upper()
+                hace_referencia_imagen = resultado.startswith("IMAGEN")
+                print(f"   🤖 Clasificador de modo: '{consulta}' → {resultado}")
+            except Exception as e:
+                print(f"   ⚠️ Error en clasificador de modo, fallback a texto: {e}")
+                hace_referencia_imagen = False
+            
+            if hace_referencia_imagen:
+                modo = "con_imagen"
+                print("🖼️ Modo multimodal detectado (imagen en memoria + referencia en consulta)")
+            else:
+                modo = "solo_texto"
+                print("📝 Modo solo texto — consulta teórica (ignorando imagen en memoria)")
         else:
             modo = "solo_texto"
-            if tiene_imagen_memoria:
-                print("📝 Modo solo texto — consulta teórica (ignorando imagen en memoria)")
-            else:
-                print("📝 Modo solo texto — sin imagen disponible")
+            print("📝 Modo solo texto — sin imagen disponible")
         
         # Registrar modo en trayectoria
         state["trayectoria"].append({
@@ -1604,7 +1769,24 @@ class AsistenteHistologiaNeo4j:
     # ------------------------------------------------------------------
 
     async def _nodo_inicializar(self, state: AgentState) -> AgentState:
-        print("📝 Inicializando flujo v4.1 (Neo4j)")
+        print("📝 Inicializando flujo v4.2 (Neo4j + Conversacional)")
+        
+        consulta_original = state.get("consulta_texto", "")
+        
+        # Obtener historial conversacional
+        historial = self.memoria.get_history_for_prompt(5)
+        state["historial_conversacional"]    = historial
+        
+        # Reescribir consulta si tiene referencias anafóricas
+        consulta_reescrita = await self._reescribir_consulta_con_contexto(consulta_original, historial)
+        if consulta_reescrita != consulta_original:
+            state["consulta_texto"] = consulta_reescrita
+        
+        # Detectar si el usuario pide imágenes del contenido
+        state["mostrar_imagenes"]            = self._detectar_solicitud_imagen(consulta_original)
+        if state["mostrar_imagenes"]:
+            print("   🖼️ Solicitud de imagen detectada")
+        
         state["contexto_memoria"]            = self.memoria.get_context(state.get("consulta_texto", ""))
         state["contenido_base"]              = self.contenido_base
         state["tiempo_inicio"]               = time.time()
@@ -2112,6 +2294,24 @@ class AsistenteHistologiaNeo4j:
             return state
 
         tiene_comparativo = bool(_safe(state.get("analisis_comparativo")))
+        historial_str = _safe(state.get("historial_conversacional"))
+
+        # ── Instrucción de prosa y continuidad conversacional ──────────
+        instruccion_prosa = (
+            "ESTILO DE RESPUESTA:\n"
+            "- Respondé en prosa, como un profesor explicando en texto corrido.\n"
+            "- Evitá listas con bullets, numeración y formato estructurado rígido.\n"
+            "- Conectá los conceptos de forma fluida entre párrafos.\n"
+            "- Usá un tono didáctico y natural.\n"
+        )
+        instruccion_continuidad = ""
+        if historial_str:
+            instruccion_continuidad = (
+                "- Tenés un historial de conversación previo. Adaptá tu respuesta como "
+                "continuación natural del diálogo, sin repetir información ya proporcionada.\n"
+            )
+        
+        instruccion_imagenes = ""
 
         # ── System prompt diferenciado según modo ──────────────────────
         if es_solo_texto:
@@ -2124,11 +2324,9 @@ class AsistenteHistologiaNeo4j:
                 "3. NO inventes información que no esté en las secciones proporcionadas.\n"
                 "4. Si la información es parcial, indicá qué partes provienen del manual y cuáles no están disponibles.\n"
                 "5. No diagnósticos clínicos salvo que estén explícitos en el manual.\n\n"
-                "ESTRUCTURA DE RESPUESTA:\n"
-                "1. Respuesta directa a la consulta basada en el manual\n"
-                "2. Características histológicas relevantes según la base de datos\n"
-                "3. Fuentes y referencias del manual\n"
-                "4. Conclusión"
+                f"{instruccion_prosa}"
+                f"{instruccion_continuidad}"
+                f"{instruccion_imagenes}"
             )
         else:
             nota_comp = (
@@ -2138,9 +2336,9 @@ class AsistenteHistologiaNeo4j:
             regla_validacion = (
                 "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. "
                 "Si la conclusión final del análisis dice explícitamente 'TEJIDOS DIFERENTES' o 'NO son la misma estructura', "
-                "entonces debes decir EXACTAMENTE: "
-                "'no esta en base de datos: [Manual: No disponible] | [Imagen: NUEVA IMAGEN DEL USUARIO]' "
-                "y no escribir nada más. "
+                "entonces respondé con algo como: "
+                "'No puedo identificar esta estructura con certeza porque no se encuentra en el contenido del manual disponible. "
+                "Te sugiero consultar con tu docente o subir otra imagen con mejor resolución.' "
                 "Si el análisis menciona 'similitudes', 'coinciden', 'mismo tejido', o 'SÍ son la misma estructura', "
                 "entonces asume que SÍ coinciden y continúa con el paso 3 detallando el tejido según el manual.\n"
             )
@@ -2155,11 +2353,11 @@ class AsistenteHistologiaNeo4j:
                 "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
                    "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
                 "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
-                "ESTRUCTURA:\n"
-                "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
+                f"{instruccion_prosa}"
+                f"{instruccion_continuidad}"
+                f"{instruccion_imagenes}"
+                "VALIDACIÓN:\n"
                 f"{regla_validacion}"
-                "3. Características histológicas según la base de datos (SOLO lo que dice el texto del manual)\n"
-                "4. Conclusión y confianza"
                 f"{nota_comp}"
             )
 
@@ -2176,17 +2374,29 @@ class AsistenteHistologiaNeo4j:
         seccion_est  = (f"\n\n**ESTRUCTURA IDENTIFICADA:** {estructura_str}"
                         if estructura_str else "")
 
-        content_parts = [{"type": "text", "text": (
+        content_parts = []
+        
+        # Inyectar historial conversacional si existe
+        if historial_str:
+            content_parts.append({"type": "text", "text": (
+                f"**HISTORIAL DE CONVERSACIÓN:**\n{historial_str}\n\n---\n"
+            )})
+        
+        # Limitar contexto_documentos para no saturar el prompt
+        ctx_docs = state['contexto_documentos']
+        if len(ctx_docs) > 4000:
+            ctx_docs = ctx_docs[:4000] + "\n... [contexto truncado]"
+        
+        content_parts.append({"type": "text", "text": (
             f"**CONSULTA:** {state['consulta_texto']}\n\n"
-            f"**HISTORIAL:** {contexto_mem_str[:300]}\n\n"
             f"**TÉRMINOS:** {terminos_str[:300]}\n\n"
             f"**ENTIDADES (grafo):** {entidades_str}\n\n"
             f"**TEMA:** {tema_str}\n\n"
             f"**ANÁLISIS VISUAL USUARIO:**\n{analisis_visual_str[:800]}\n\n"
-            f"**SECCIONES DEL MANUAL:**\n{state['contexto_documentos']}"
+            f"**SECCIONES DEL MANUAL:**\n{ctx_docs}"
             f"{seccion_comp}{seccion_est}\n\n"
             "Responde EXCLUSIVAMENTE con el contenido del manual e imágenes de referencia."
-        )}]
+        )})
 
         imagen_path = state.get("imagen_path")
         if state.get("tiene_imagen") and imagen_path and os.path.exists(imagen_path):
@@ -2263,6 +2473,7 @@ class AsistenteHistologiaNeo4j:
                 "estructura_identificada": state.get("estructura_identificada"),
                 "imagenes_recuperadas":    state.get("imagenes_recuperadas", []),
                 "entidades_consulta":      state.get("entidades_consulta", {}),
+                "mostrar_imagenes":        state.get("mostrar_imagenes", False),
             }, f, indent=4, ensure_ascii=False)
 
         print(f"✅ Flujo v4.1 completado en {total}s")
@@ -2408,21 +2619,20 @@ class AsistenteHistologiaNeo4j:
                          user_id: str = "default_user") -> str:
         """
         La imagen es completamente opcional en cada llamada.
-        Si no se pasa, se reutiliza la última imagen activa en memoria.
+        Si no se pasa, el router decide si reutilizar la imagen activa en memoria.
         """
-        imagen_activa       = imagen_path or self.memoria.get_imagen_activa()
         tiene_imagen_activa = self.memoria.tiene_imagen_previa() or bool(imagen_path)
 
         print(f"\n{'='*70}")
         print(f"🔬 RAG Histología Neo4j v4.2 | umbral={self.SIMILARITY_THRESHOLD}")
         print(f"   Texto:         {consulta_texto}")
         print(f"   Imagen turno:  {imagen_path or 'ninguna'}")
-        print(f"   Imagen activa: {imagen_activa or 'ninguna'}")
+        print(f"   Imagen memoria: {self.memoria.get_imagen_activa() or 'ninguna'}")
         print(f"{'='*70}")
 
         initial_state = AgentState(
             messages=[], consulta_texto=consulta_texto,
-            imagen_path=imagen_activa,
+            imagen_path=imagen_path,
             imagen_embedding_uni=None, imagen_embedding_plip=None, texto_embedding=None, contexto_memoria="",
             contenido_base=self.contenido_base, terminos_busqueda="",
             entidades_consulta={"tejidos": [], "estructuras": [], "tinciones": []},
@@ -2435,6 +2645,7 @@ class AsistenteHistologiaNeo4j:
             imagenes_texto_map={},
             analisis_comparativo=None, estructura_identificada=None,
             similitud_semantica_dominio=0.0, confianza_baja=False,
+            mostrar_imagenes=False, historial_conversacional="",
         )
 
         config = {
@@ -2454,10 +2665,20 @@ class AsistenteHistologiaNeo4j:
         except Exception as e:
             import traceback; traceback.print_exc()
             respuesta = f"Error: {e}"
+            final = {}
 
         print(f"\n{'='*70}\n📖 RESPUESTA:\n{'='*70}")
         print(respuesta)
         print("="*70)
+        
+        # Retornar dict con toda la info para el server
+        self._ultimo_resultado = {
+            "respuesta": respuesta,
+            "mostrar_imagenes": final.get("mostrar_imagenes", False),
+            "imagenes_recuperadas": final.get("imagenes_recuperadas", []),
+            "estructura_identificada": final.get("estructura_identificada"),
+        }
+        
         return respuesta
 
     async def cerrar(self):
