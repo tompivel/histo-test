@@ -1,21 +1,23 @@
 # =============================================================================
-# RAG Multimodal de Histología con ImageBind + Neo4j — VERSIÓN 4.1
+# RAG Multimodal de Histología con ImageBind + Neo4j — VERSIÓN 4.2
 # =============================================================================
-# Cambios sobre v4.0:
-#   1. RAGAS eliminado completamente (clase MetricasRAGAS, imports, nodo
-#      evaluar_ragas, campo ground_truth, comando reporte).
-#   2. MEMORIA DE IMAGEN PERSISTENTE: la imagen se recuerda entre turnos.
-#      Si el usuario no sube imagen nueva, se reutiliza la del turno anterior.
-#      Comando "nueva imagen" para limpiarla explícitamente.
-#   3. CLASIFICADOR SEMÁNTICO: reemplaza verificación por keywords. Combina
-#      embedding ImageBind + razonamiento LLM. Entiende "¿de qué tejido se
-#      trata?" sin mencionar palabras del temario.
-#   4. MEMORIA SIEMPRE ACTUALIZADA: se guarda la interacción aunque el RAG
-#      no encuentre contexto suficiente.
-#   5. MODO INTERACTIVO MEJORADO: flujo natural de chat, imagen opcional en
-#      cada turno, sin prompts redundantes.
-#   6. Todos los fixes heredados de v3.1/v4.0 se mantienen:
-#      _safe(), deduplicación con loop explícito, _nodo_analisis_comparativo.
+# Cambios sobre v4.1:
+#   1. REFACTORING CONSULTAS DE TEXTO: Flujo bifurcado en LangGraph.
+#      Consultas sin imagen saltan procesar_imagen y analisis_comparativo.
+#   2. ROUTER CONDICIONAL: _route_por_modo decide el camino del grafo.
+#   3. UMBRALES DIFERENCIADOS: texto puro usa umbral 0.45 (más permisivo),
+#      modo imagen mantiene 0.6 para texto y 0.45 para imágenes.
+#   4. SYSTEM PROMPT DIFERENCIADO: modo texto tiene prompt optimizado para
+#      respuestas enciclopédicas sin referencias a imágenes del usuario.
+#   5. MEJOR MANEJO DE NO-CONTEXTO: en modo texto, mensaje amable indicando
+#      que no se encontró info, en vez de "fuera de dominio".
+# =============================================================================
+# Cambios v4.1:
+#   1. RAGAS eliminado completamente.
+#   2. MEMORIA DE IMAGEN PERSISTENTE.
+#   3. CLASIFICADOR SEMÁNTICO.
+#   4. MEMORIA SIEMPRE ACTUALIZADA.
+#   5. MODO INTERACTIVO MEJORADO.
 # =============================================================================
 
 import os
@@ -1428,7 +1430,7 @@ class AsistenteHistologiaNeo4j:
                     self.device = "cpu"
             except:
                 pass
-        print(f"✅ AsistenteHistologiaNeo4j v4.1 inicializado en {self.device}")
+        print(f"✅ AsistenteHistologiaNeo4j v4.2 inicializado en {self.device}")
 
     def _setup_apis(self):
         os.environ["GOOGLE_API_KEY"] = userdata.get("GOOGLE_API_KEY") or ""
@@ -1512,7 +1514,13 @@ class AsistenteHistologiaNeo4j:
         g.add_node("fuera_temario",        self._nodo_fuera_temario)
 
         g.add_edge(START,                  "inicializar")
-        g.add_edge("inicializar",          "procesar_imagen")
+
+        # Router: si hay imagen → procesar_imagen, si solo texto → clasificar
+        g.add_conditional_edges(
+            "inicializar",
+            self._route_por_modo,
+            {"con_imagen": "procesar_imagen", "solo_texto": "clasificar"}
+        )
         g.add_edge("procesar_imagen",      "clasificar")
 
         g.add_conditional_edges(
@@ -1523,12 +1531,70 @@ class AsistenteHistologiaNeo4j:
         g.add_edge("fuera_temario",        "finalizar")
         g.add_edge("generar_consulta",     "buscar_neo4j")
         g.add_edge("buscar_neo4j",         "filtrar_contexto")
-        g.add_edge("filtrar_contexto",     "analisis_comparativo")
+
+        # Router: si hay imagen → analisis_comparativo, si no → generar_respuesta
+        g.add_conditional_edges(
+            "filtrar_contexto",
+            self._route_analisis_comparativo,
+            {"con_imagen": "analisis_comparativo", "sin_imagen": "generar_respuesta"}
+        )
         g.add_edge("analisis_comparativo", "generar_respuesta")
         g.add_edge("generar_respuesta",    "finalizar")
         g.add_edge("finalizar",            END)
 
         self.graph = g
+
+    def _route_por_modo(self, state: AgentState) -> str:
+        """Decide si procesar imagen o ir directo a clasificar (texto puro)."""
+        imagen_path = state.get("imagen_path")
+        tiene_imagen_nueva = imagen_path and os.path.exists(imagen_path)
+        tiene_imagen_memoria = self.memoria and self.memoria.tiene_imagen_previa()
+        
+        # Detectar si la consulta hace referencia explícita a una imagen
+        consulta_texto = state.get("consulta_texto", "").lower()
+        palabras_referencia_imagen = [
+            "imagen", "foto", "esta", "esto", "este", "esa", "eso", "ese",
+            "la imagen", "la foto", "qué es esto", "qué es esta", "qué tipo",
+            "identifica", "analiza", "describe", "observa", "muestra",
+            "se ve", "veo", "aparece", "presenta"
+        ]
+        hace_referencia_imagen = any(palabra in consulta_texto for palabra in palabras_referencia_imagen)
+        
+        # Lógica de routing:
+        # 1. Si hay imagen nueva → siempre modo con_imagen
+        # 2. Si hay imagen en memoria Y la consulta hace referencia → modo con_imagen
+        # 3. Si hay imagen en memoria pero la consulta NO hace referencia → modo solo_texto
+        # 4. Si no hay imagen → modo solo_texto
+        
+        if tiene_imagen_nueva:
+            modo = "con_imagen"
+            print("🖼️ Modo multimodal detectado (imagen nueva)")
+        elif tiene_imagen_memoria and hace_referencia_imagen:
+            modo = "con_imagen"
+            print("🖼️ Modo multimodal detectado (imagen en memoria + referencia en consulta)")
+        else:
+            modo = "solo_texto"
+            if tiene_imagen_memoria:
+                print("📝 Modo solo texto — consulta teórica (ignorando imagen en memoria)")
+            else:
+                print("📝 Modo solo texto — sin imagen disponible")
+        
+        # Registrar modo en trayectoria
+        state["trayectoria"].append({
+            "nodo": "Router:_route_por_modo",
+            "modo_detectado": modo,
+            "tiene_imagen_nueva": tiene_imagen_nueva,
+            "tiene_imagen_memoria": tiene_imagen_memoria,
+            "hace_referencia_imagen": hace_referencia_imagen
+        })
+        
+        return modo
+
+    def _route_analisis_comparativo(self, state: AgentState) -> str:
+        """Salta análisis comparativo si no hay imagen."""
+        if state.get("tiene_imagen") and state.get("imagen_path"):
+            return "con_imagen"
+        return "sin_imagen"
 
     def _route_por_temario(self, state: AgentState) -> str:
         return "en_temario"
@@ -1822,13 +1888,18 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_filtrar_contexto(self, state: AgentState) -> AgentState:
         t0     = time.time()
-        umbral = self.SIMILARITY_THRESHOLD
+        umbral_imagen = self.SIMILARITY_THRESHOLD
+        es_solo_texto = not state.get("tiene_imagen", False)
+
+        # Umbral de texto más permisivo en modo solo texto
+        umbral_texto = 0.45 if es_solo_texto else 0.6
+
         validos = []
         for r in state["resultados_busqueda"]:
             current_sim = r.get("similitud", 0)
-            if r.get("tipo") == "texto" and current_sim < 0.6:
+            if r.get("tipo") == "texto" and current_sim < umbral_texto:
                 continue
-            if r.get("tipo") == "imagen" and current_sim < umbral:
+            if r.get("tipo") == "imagen" and current_sim < umbral_imagen:
                 continue
 
             # Si es imagen pero no existe el archivo en disco, lo rechazamos
@@ -1864,14 +1935,17 @@ class AsistenteHistologiaNeo4j:
                 enc += "]"
                 bloques.append(f"{enc}\n{_safe(r.get('texto',''))[:700]}")
             state["contexto_documentos"] = "\n\n".join(bloques)
-            print(f"✅ {len(validos)} válidos | {len(imagenes_unicas)} imágenes")
+            modo_str = "TEXTO" if es_solo_texto else "IMAGEN+TEXTO"
+            print(f"✅ {len(validos)} válidos | {len(imagenes_unicas)} imgs | Modo: {modo_str}")
         else:
             state["contexto_documentos"] = ""
-            print(f"⚠️ Ningún resultado supera umbral {umbral}")
+            print(f"⚠️ Ningún resultado supera umbral (texto={umbral_texto}, img={umbral_imagen})")
 
         state["trayectoria"].append({
             "nodo": "FiltrarContexto", "hits_validos": len(validos),
-            "imgs": len(state["imagenes_recuperadas"]), "tiempo": round(time.time()-t0, 2)
+            "imgs": len(state["imagenes_recuperadas"]),
+            "modo": "solo_texto" if es_solo_texto else "multimodal",
+            "tiempo": round(time.time()-t0, 2)
         })
         return state
 
@@ -1954,7 +2028,10 @@ class AsistenteHistologiaNeo4j:
             "TU ROL ES SER UN EVALUADOR OBJETIVO. Tu objetivo principal es determinar verdaderamente si la imagen de consulta y las referencias muestran la misma estructura histológica.\n\n"
             "1. TABLA COMPARATIVA (Markdown): | Feature | Consulta | Ref#1 | Ref#2 |\n"
             "2. VEREDICTO DE IDENTIDAD: Evalúa las similitudes morfológicas y declara si son el MISMO TEJIDO o TEJIDOS DIFERENTES.\n"
-            "3. CONCLUSIÓN FINAL: ¿Son la misma estructura biológica? (SÍ/NO). Si es NO, indica qué crees que es realmente la imagen de la consulta."
+            "3. CONCLUSIÓN FINAL: Debes terminar con una de estas dos frases EXACTAS:\n"
+            "   - Si coinciden: 'CONCLUSIÓN: SÍ son la misma estructura histológica'\n"
+            "   - Si NO coinciden: 'CONCLUSIÓN: TEJIDOS DIFERENTES'\n"
+            "   Si hay dudas pero las similitudes son significativas, considera que SÍ coinciden."
         )})
 
         try:
@@ -1989,59 +2066,102 @@ class AsistenteHistologiaNeo4j:
 
     async def _nodo_generar_respuesta(self, state: AgentState) -> AgentState:
         t0 = time.time()
-        print("💭 Generando respuesta v4.1...")
+        es_solo_texto = not state.get("tiene_imagen", False)
+        modo_str = "TEXTO" if es_solo_texto else "MULTIMODAL"
+        print(f"💭 Generando respuesta v4.2 [{modo_str}]...")
 
         if not state["contexto_suficiente"]:
-            print("   ⚠️ Sin contexto RAG — aplicando rechazo estricto (fuera de dominio)")
-            temario = state.get("temario") or []
-            muestra = "\n".join(f"  • {t}" for t in temario[:20])
-            if len(temario) > 20:
-                muestra += f"\n  ... y {len(temario)-20} más"
-            state["respuesta_final"] = (
-                "⚠️ **Consulta fuera del dominio disponible**\n\n"
-                "Tu consulta no parece estar relacionada con histología, patología "
-                "o morfología tisular/celular.\n\n"
-                f"**Temas disponibles (muestra):**\n{muestra}\n\n"
-                "Si tenés una imagen histológica, subila y reformulá tu pregunta. "
-                "Ejemplos válidos: '¿qué tipo de tejido es este?', "
-                "'describe la estructura observada', 'diagnóstico diferencial'."
-            )
+            if es_solo_texto:
+                # Modo texto sin contexto: respuesta más amable
+                print("   ⚠️ Sin contexto RAG para consulta de texto")
+                temario = state.get("temario") or []
+                muestra = "\n".join(f"  • {t}" for t in temario[:15])
+                if len(temario) > 15:
+                    muestra += f"\n  ... y {len(temario)-15} más"
+                state["respuesta_final"] = (
+                    "⚠️ **No encontré información específica sobre eso en el manual**\n\n"
+                    "La consulta es válida pero no encontré contenido suficiente en la "
+                    "base de datos del manual para responderla con precisión.\n\n"
+                    f"**Temas disponibles en el manual (muestra):**\n{muestra}\n\n"
+                    "Podés intentar:\n"
+                    "- Reformular la pregunta con términos más específicos\n"
+                    "- Preguntar sobre alguno de los temas listados arriba\n"
+                    "- Subir una imagen histológica para análisis visual"
+                )
+            else:
+                # Modo imagen sin contexto: rechazo estricto
+                print("   ⚠️ Sin contexto RAG — rechazo (imagen no encontrada en DB)")
+                temario = state.get("temario") or []
+                muestra = "\n".join(f"  • {t}" for t in temario[:20])
+                if len(temario) > 20:
+                    muestra += f"\n  ... y {len(temario)-20} más"
+                state["respuesta_final"] = (
+                    "⚠️ **Consulta fuera del dominio disponible**\n\n"
+                    "Tu consulta no parece estar relacionada con histología, patología "
+                    "o morfología tisular/celular.\n\n"
+                    f"**Temas disponibles (muestra):**\n{muestra}\n\n"
+                    "Si tenés una imagen histológica, subila y reformulá tu pregunta. "
+                    "Ejemplos válidos: '¿qué tipo de tejido es este?', "
+                    "'describe la estructura observada', 'diagnóstico diferencial'."
+                )
             state["trayectoria"].append({
                 "nodo": "GenerarRespuesta", "contexto_suficiente": False,
+                "modo": "solo_texto" if es_solo_texto else "multimodal",
                 "tiempo": round(time.time()-t0, 2)
             })
             return state
 
         tiene_comparativo = bool(_safe(state.get("analisis_comparativo")))
-        nota_comp = (
-            "\n\nIMPORTANTE: El análisis comparativo tiene PRIORIDAD en el diagnóstico diferencial."
-            if tiene_comparativo else ""
-        )
 
-        regla_validacion = (
-            "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. Si y sólo si la conclusión de ese análisis afirma enfáticamente que son TEJIDOS DIFERENTES, debes decir EXACTAMENTE: 'no esta en base de datos: [Manual: No disponible] | [Imagen: NUEVA IMAGEN DEL USUARIO]' y no escribir nada más. De lo contrario, asume que coinciden y continúa con el paso 3 detallando el tejido.\n"
-            if state.get("tiene_imagen") else
-            "2. VALIDACIÓN: Si la información solicitada no existe en el texto del manual, indica que no está en la base de datos.\n"
-        )
-
-        system_prompt = (
-            "Eres un asistente de histología. Responde SOLO con el contenido del manual o la imagen visible en el chat.\n\n"
-            "REGLAS FUNDAMENTALES:\n"
-            "1. PRIORIDAD ABSOLUTA: La DESCRIPCIÓN TEXTUAL DEL MANUAL es la fuente de verdad. "
-               "Si el texto del manual dice 'Tejido nervioso corteza cerebelosa', ESO es lo correcto, "
-               "sin importar tu propia interpretación visual de la imagen.\n"
-            "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
-            "3. Para cada 'IMAGEN DE REFERENCIA', indica el nombre y la descripción textual del manual.\n"
-            "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
-               "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
-            "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
-            "ESTRUCTURA:\n"
-            "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
-            f"{regla_validacion}"
-            "3. Características histológicas según la base de datos (SOLO lo que dice el texto del manual)\n"
-            "4. Conclusión y confianza"
-            f"{nota_comp}"
-        )
+        # ── System prompt diferenciado según modo ──────────────────────
+        if es_solo_texto:
+            system_prompt = (
+                "Eres un asistente experto de histología. Respondés consultas de texto "
+                "basándote EXCLUSIVAMENTE en el contenido del manual/base de datos.\n\n"
+                "REGLAS FUNDAMENTALES:\n"
+                "1. FUENTE DE VERDAD: Usá SOLO la información de las SECCIONES DEL MANUAL proporcionadas.\n"
+                "2. CITAS: Citá las fuentes con [Manual: archivo].\n"
+                "3. NO inventes información que no esté en las secciones proporcionadas.\n"
+                "4. Si la información es parcial, indicá qué partes provienen del manual y cuáles no están disponibles.\n"
+                "5. No diagnósticos clínicos salvo que estén explícitos en el manual.\n\n"
+                "ESTRUCTURA DE RESPUESTA:\n"
+                "1. Respuesta directa a la consulta basada en el manual\n"
+                "2. Características histológicas relevantes según la base de datos\n"
+                "3. Fuentes y referencias del manual\n"
+                "4. Conclusión"
+            )
+        else:
+            nota_comp = (
+                "\n\nIMPORTANTE: El análisis comparativo tiene PRIORIDAD en el diagnóstico diferencial."
+                if tiene_comparativo else ""
+            )
+            regla_validacion = (
+                "2. VALIDACIÓN: Revisa el 'ANÁLISIS COMPARATIVO'. "
+                "Si la conclusión final del análisis dice explícitamente 'TEJIDOS DIFERENTES' o 'NO son la misma estructura', "
+                "entonces debes decir EXACTAMENTE: "
+                "'no esta en base de datos: [Manual: No disponible] | [Imagen: NUEVA IMAGEN DEL USUARIO]' "
+                "y no escribir nada más. "
+                "Si el análisis menciona 'similitudes', 'coinciden', 'mismo tejido', o 'SÍ son la misma estructura', "
+                "entonces asume que SÍ coinciden y continúa con el paso 3 detallando el tejido según el manual.\n"
+            )
+            system_prompt = (
+                "Eres un asistente de histología. Responde SOLO con el contenido del manual o la imagen visible en el chat.\n\n"
+                "REGLAS FUNDAMENTALES:\n"
+                "1. PRIORIDAD ABSOLUTA: La DESCRIPCIÓN TEXTUAL DEL MANUAL es la fuente de verdad. "
+                   "Si el texto del manual dice 'Tejido nervioso corteza cerebelosa', ESO es lo correcto, "
+                   "sin importar tu propia interpretación visual de la imagen.\n"
+                "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
+                "3. Para cada 'IMAGEN DE REFERENCIA', indica el nombre y la descripción textual del manual.\n"
+                "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
+                   "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
+                "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+                "ESTRUCTURA:\n"
+                "1. Análisis de la consulta basado en la imagen del usuario (si la hay)\n"
+                f"{regla_validacion}"
+                "3. Características histológicas según la base de datos (SOLO lo que dice el texto del manual)\n"
+                "4. Conclusión y confianza"
+                f"{nota_comp}"
+            )
 
         analisis_comp_str   = _safe(state.get("analisis_comparativo"))
         estructura_str      = _safe(state.get("estructura_identificada"))
@@ -2294,7 +2414,7 @@ class AsistenteHistologiaNeo4j:
         tiene_imagen_activa = self.memoria.tiene_imagen_previa() or bool(imagen_path)
 
         print(f"\n{'='*70}")
-        print(f"🔬 RAG Histología Neo4j v4.1 | umbral={self.SIMILARITY_THRESHOLD}")
+        print(f"🔬 RAG Histología Neo4j v4.2 | umbral={self.SIMILARITY_THRESHOLD}")
         print(f"   Texto:         {consulta_texto}")
         print(f"   Imagen turno:  {imagen_path or 'ninguna'}")
         print(f"   Imagen activa: {imagen_activa or 'ninguna'}")
@@ -2368,11 +2488,12 @@ async def modo_interactivo(reindex: bool = False, force: bool = False):
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║   RAG Histología Neo4j + ImageBind v4.1 — Chat Interactivo  ║
+║  RAG Histología Neo4j v4.2 — Chat Interactivo               ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  • Escribí tu pregunta y presioná Enter                     ║
 ║  • Para subir una imagen: escribí el PATH cuando se pida    ║
 ║  • La imagen se recuerda entre turnos — no es obligatoria   ║
+║  • ✨ Consultas de texto puro — flujo optimizado            ║
 ║  • Comandos especiales:                                     ║
 ║      temario       → ver temas disponibles                  ║
 ║      imagen actual → ver imagen activa en el chat           ║
