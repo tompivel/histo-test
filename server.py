@@ -230,8 +230,8 @@ async def post_chat(req: ChatRequest):
                 except Exception as e:
                     print(f"⚠️ Error leyendo imagen {img_path}: {e}")
 
-        # Siempre buscar imagen relevante en Neo4j si no hay imágenes del RAG
-        if not imagenes_b64 and hasattr(asistente, 'neo4j') and asistente.neo4j:
+        # Solo buscar imagen en Neo4j si el usuario la pidió explícitamente
+        if not imagenes_b64 and mostrar_imgs and hasattr(asistente, 'neo4j') and asistente.neo4j:
             import re
             import unicodedata
             
@@ -248,16 +248,31 @@ async def post_chat(req: ChatRequest):
             
             if terminos_expandidos:
                 try:
+                    # Búsqueda precisa: rankear imágenes por cantidad de términos que matchean en caption
                     neo_res = await asistente.neo4j.run(
                         """MATCH (i:Imagen) WHERE i.path IS NOT NULL
-                        AND ANY(t IN $terminos WHERE 
-                            toLower(coalesce(i.texto_pagina,'')) CONTAINS t OR
-                            toLower(coalesce(i.ocr_text,'')) CONTAINS t OR
-                            toLower(coalesce(i.caption,'')) CONTAINS t)
-                        RETURN i.path AS path, coalesce(i.caption,'') AS caption
+                        WITH i, toLower(coalesce(i.caption,'')) AS cap
+                        WITH i, cap, 
+                             size([t IN $terminos WHERE cap CONTAINS t]) AS matches
+                        WHERE matches > 0
+                        RETURN i.path AS path, coalesce(i.caption,'') AS caption, matches
+                        ORDER BY matches DESC
                         LIMIT 1""",
                         {"terminos": terminos_expandidos}
                     )
+                    # Fallback: buscar en ocr_text si no hay resultado por caption
+                    if not neo_res:
+                        neo_res = await asistente.neo4j.run(
+                            """MATCH (i:Imagen) WHERE i.path IS NOT NULL
+                            WITH i, toLower(coalesce(i.ocr_text,'')) AS ocr
+                            WITH i, ocr,
+                                 size([t IN $terminos WHERE ocr CONTAINS t]) AS matches
+                            WHERE matches > 0
+                            RETURN i.path AS path, coalesce(i.caption,'') AS caption, matches
+                            ORDER BY matches DESC
+                            LIMIT 1""",
+                            {"terminos": terminos_expandidos}
+                        )
                     for r in neo_res:
                         p = r.get("path")
                         if p and os.path.exists(p):
