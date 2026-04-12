@@ -1644,8 +1644,10 @@ class AsistenteHistologiaNeo4j:
     # ------------------------------------------------------------------
 
     def _detectar_solicitud_imagen(self, consulta: str) -> bool:
-        """Deshabilitado — foco en respuestas de texto."""
-        return False
+        """Detecta si la consulta solicita ver una imagen del contenido."""
+        KEYWORDS = ["imagen", "foto", "mostrame", "mostrá", "muéstrame", "ver imagen",
+                    "quiero ver", "dejame ver", "enseñame", "microfotografía"]
+        return any(kw in consulta.lower() for kw in KEYWORDS)
 
     async def _reescribir_consulta_con_contexto(self, consulta: str, historial: str) -> str:
         """Reescribe la consulta resolviendo referencias anafóricas usando el historial.

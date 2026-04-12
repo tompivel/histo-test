@@ -180,33 +180,23 @@ function addMessage(role, text, imageBase64 = null, metadata = null) {
     if (role === 'assistant') {
         bubble.innerHTML += renderMarkdown(text);
         
-        // Renderizar imágenes recuperadas si mostrar_imagenes=true
-        const shouldShowImages = metadata && 
-            (metadata.mostrar_imagenes === true) && 
-            metadata.imagenes_recuperadas && 
-            metadata.imagenes_recuperadas.length > 0;
-        
-        console.log("Image render check:", {
-            mostrar: metadata?.mostrar_imagenes,
-            imgs: metadata?.imagenes_recuperadas,
-            count: metadata?.imagenes_recuperadas?.length,
-            shouldShow: shouldShowImages
-        });
-        
-        if (shouldShowImages) {
+        // Renderizar imágenes recuperadas como base64
+        console.log("🖼️ Checking images:", metadata?.imagenes_base64?.length, "images available");
+        if (metadata && metadata.imagenes_base64 && metadata.imagenes_base64.length > 0) {
+            console.log("🖼️ Rendering", metadata.imagenes_base64.length, "images");
             const imgContainer = document.createElement('div');
             imgContainer.className = 'retrieved-images';
-            metadata.imagenes_recuperadas.forEach(filename => {
+            metadata.imagenes_base64.forEach(imgData => {
                 const figure = document.createElement('figure');
                 figure.className = 'retrieved-image-figure';
                 const img = document.createElement('img');
-                img.src = `/imagenes_extraidas/${filename}`;
-                img.alt = filename;
+                img.src = `data:${imgData.mime_type};base64,${imgData.base64}`;
+                img.alt = imgData.filename;
                 img.className = 'retrieved-image';
                 img.onclick = () => window.open(img.src, '_blank');
                 img.onerror = () => { figure.style.display = 'none'; };
                 const caption = document.createElement('figcaption');
-                caption.textContent = filename.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
+                caption.textContent = imgData.filename.replace(/\.[^.]+$/, '').replace(/_/g, ' ');
                 figure.appendChild(img);
                 figure.appendChild(caption);
                 imgContainer.appendChild(figure);

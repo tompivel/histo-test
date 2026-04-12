@@ -60,6 +60,7 @@ class ChatResponse(BaseModel):
     respuesta: str
     estructura_identificada: Optional[str] = None
     imagenes_recuperadas: list = []
+    imagenes_base64: list = []  # Lista de {filename, base64, mime_type}
     trayectoria: list = []
     imagen_activa: Optional[str] = None
     mostrar_imagenes: bool = False
@@ -212,6 +213,97 @@ async def post_chat(req: ChatRequest):
         imagenes_rec_directas = resultado_directo.get("imagenes_recuperadas", [])
         estructura = resultado_directo.get("estructura_identificada")
 
+        # Convertir imágenes recuperadas a base64 para el frontend
+        imagenes_b64 = []
+        for img_path in imagenes_rec_directas[:1]:  # Solo la de mayor similitud
+            if img_path and os.path.exists(img_path):
+                try:
+                    with open(img_path, "rb") as f:
+                        data_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    ext = os.path.splitext(img_path)[1].lower()
+                    mime = "image/png" if ext == ".png" else "image/jpeg"
+                    imagenes_b64.append({
+                        "filename": os.path.basename(img_path),
+                        "base64": data_b64,
+                        "mime_type": mime
+                    })
+                except Exception as e:
+                    print(f"⚠️ Error leyendo imagen {img_path}: {e}")
+
+        # Siempre buscar imagen relevante en Neo4j si no hay imágenes del RAG
+        if not imagenes_b64 and hasattr(asistente, 'neo4j') and asistente.neo4j:
+            import re
+            import unicodedata
+            
+            def sin_tildes(s):
+                return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+            
+            # Extraer términos de búsqueda de la consulta original
+            palabras_ignorar = {"imagen", "imagenes", "foto", "mostrame", "mostra", "quiero",
+                               "dame", "pasame", "una", "ver", "del", "las", "los", "que", "como"}
+            terminos = [w.strip().lower() for w in req.query.split() 
+                       if len(w.strip()) > 3 and w.strip().lower() not in palabras_ignorar]
+            # Agregar variantes sin tildes
+            terminos_expandidos = list(set(terminos + [sin_tildes(t) for t in terminos]))
+            
+            if terminos_expandidos:
+                try:
+                    neo_res = await asistente.neo4j.run(
+                        """MATCH (i:Imagen) WHERE i.path IS NOT NULL
+                        AND ANY(t IN $terminos WHERE 
+                            toLower(coalesce(i.texto_pagina,'')) CONTAINS t OR
+                            toLower(coalesce(i.ocr_text,'')) CONTAINS t OR
+                            toLower(coalesce(i.caption,'')) CONTAINS t)
+                        RETURN i.path AS path, coalesce(i.caption,'') AS caption
+                        LIMIT 1""",
+                        {"terminos": terminos_expandidos}
+                    )
+                    for r in neo_res:
+                        p = r.get("path")
+                        if p and os.path.exists(p):
+                            with open(p, "rb") as f:
+                                data_b64 = base64.b64encode(f.read()).decode("utf-8")
+                            ext = os.path.splitext(p)[1].lower()
+                            mime = "image/png" if ext == ".png" else "image/jpeg"
+                            imagenes_b64.append({
+                                "filename": os.path.basename(p),
+                                "base64": data_b64,
+                                "mime_type": mime
+                            })
+                            print(f"   🖼️ Imagen encontrada por entidad: {os.path.basename(p)}")
+                except Exception as e:
+                    print(f"⚠️ Error buscando imágenes por entidades: {e}")
+            
+            # Fallback: buscar por regex "Imagen X.Y" en la respuesta del LLM
+            if not imagenes_b64 and respuesta:
+                refs = re.findall(r'[Ii]magen\s+(\d+[\.\s]*\d*)', respuesta)
+                archivos_vistos = set()
+                for ref_raw in refs[:1]:  # Solo la primera referencia
+                    ref_clean = ref_raw.strip().replace(" ", ".")
+                    caption_q = f"imagen {ref_clean}".lower()
+                    try:
+                        neo_res = await asistente.neo4j.run(
+                            "MATCH (i:Imagen) WHERE toLower(coalesce(i.caption,'')) CONTAINS $q "
+                            "RETURN i.path AS path LIMIT 1",
+                            {"q": caption_q}
+                        )
+                        if neo_res:
+                            p = neo_res[0].get("path")
+                            if p and os.path.exists(p) and p not in archivos_vistos:
+                                archivos_vistos.add(p)
+                                with open(p, "rb") as f:
+                                    data_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                ext = os.path.splitext(p)[1].lower()
+                                mime = "image/png" if ext == ".png" else "image/jpeg"
+                                imagenes_b64.append({
+                                    "filename": os.path.basename(p),
+                                    "base64": data_b64,
+                                    "mime_type": mime
+                                })
+                                print(f"   🖼️ Imagen por referencia: Imagen {ref_clean} → {os.path.basename(p)}")
+                    except Exception as e:
+                        print(f"⚠️ Error buscando ref '{ref_raw}': {e}")
+
         # Leer trayectoria del archivo (solo para metadata de debug)
         trayectoria = []
         trayectoria_file = Path(__file__).parent / "trayectoria_neo4j.json"
@@ -231,6 +323,7 @@ async def post_chat(req: ChatRequest):
             respuesta=respuesta,
             estructura_identificada=estructura,
             imagenes_recuperadas=[os.path.basename(p) for p in imagenes_rec_directas],
+            imagenes_base64=imagenes_b64,
             trayectoria=trayectoria,
             imagen_activa=img_activa,
             mostrar_imagenes=mostrar_imgs,
