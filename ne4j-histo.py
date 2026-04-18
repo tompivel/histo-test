@@ -894,11 +894,20 @@ class Neo4jClient:
 
         # 2. Búsqueda Imagen UNI
         if imagen_embedding_uni:
-            res_uni = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
+            res_uni_raw = await self.busqueda_vectorial(imagen_embedding_uni, INDEX_UNI, top_k)
+            if res_uni_raw:
+                top_sim = res_uni_raw[0].get("similitud", 0)
+                print(f"   👁️ Top similitud UNI: {top_sim:.4f} ({os.path.basename(res_uni_raw[0].get('imagen_path', ''))})")
+            # Umbral estricto para aceptar imágenes visualmente similares (evita forzar falsos positivos)
+            res_uni = [r for r in res_uni_raw if r.get("similitud", 0) >= 0.80]
 
         # 3. Búsqueda Imagen PLIP
         if imagen_embedding_plip:
-            res_plip = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
+            res_plip_raw = await self.busqueda_vectorial(imagen_embedding_plip, INDEX_PLIP, top_k)
+            if res_plip_raw:
+                top_sim = res_plip_raw[0].get("similitud", 0)
+                print(f"   👁️ Top similitud PLIP: {top_sim:.4f} ({os.path.basename(res_plip_raw[0].get('imagen_path', ''))})")
+            res_plip = [r for r in res_plip_raw if r.get("similitud", 0) >= 0.80]
 
         # 4. Entidades
         res_ent = await self.busqueda_por_entidades(entidades, top_k)
@@ -2572,22 +2581,33 @@ class AsistenteHistologiaNeo4j:
         # NO de la interpretación del LLM. La DB es la fuente de verdad:
         # si la imagen más similar en la DB tiene caption "Tejido Óseo",
         # eso es lo que es, sin importar lo que el LLM crea ver.
+        # EXCEPCIÓN: Si el análisis comparativo determinó que NO coinciden.
         estructura_db = None
-        imagenes_texto = state.get("imagenes_texto_map", {})
-        imagenes_rec = state.get("imagenes_recuperadas", [])
-        if imagenes_rec and imagenes_texto:
-            top_match_path = imagenes_rec[0]  # Imagen con mayor similitud visual
-            top_caption = imagenes_texto.get(top_match_path, "")
-            if top_caption:
-                # Extraer la estructura del título del caption (primera línea)
-                primera_linea = top_caption.split('\n')[0].strip()
-                # Buscar patrón "Imagen X.X. <descripción>"
-                match = re.match(r'Imagen\s+[\d.]+[A-Za-z]?\.\s*(.*)', primera_linea)
-                if match:
-                    estructura_db = match.group(1).rstrip('.')
-                else:
-                    estructura_db = primera_linea
-                print(f"   → Estructura (DB): {estructura_db} [de {os.path.basename(top_match_path)}]")
+        son_diferentes = False
+        analisis_str = state.get("analisis_comparativo", "")
+        if analisis_str and ("TEJIDOS DIFERENTES" in analisis_str or "NO son la misma" in analisis_str):
+            son_diferentes = True
+
+        if not son_diferentes:
+            imagenes_texto = state.get("imagenes_texto_map", {})
+            imagenes_rec = state.get("imagenes_recuperadas", [])
+            if imagenes_rec and imagenes_texto:
+                top_match_path = imagenes_rec[0]  # Imagen con mayor similitud visual
+                top_caption = imagenes_texto.get(top_match_path, "")
+                if top_caption:
+                    # Extraer la estructura del título del caption (primera línea)
+                    primera_linea = top_caption.split('\n')[0].strip()
+                    # Buscar patrón "Imagen X.X. <descripción>"
+                    match = re.match(r'Imagen\s+[\d.]+[A-Za-z]?\.\s*(.*)', primera_linea)
+                    if match:
+                        estructura_db = match.group(1).rstrip('.')
+                    else:
+                        estructura_db = primera_linea
+                    print(f"   → Estructura (DB): {estructura_db} [de {os.path.basename(top_match_path)}]")
+        else:
+            print("   → Análisis comparativo concluyó que son TEJIDOS DIFERENTES. Imagen no en BD.")
+            # Limpiar contexto para evitar que el LLM use texto de una imagen incorrecta
+            state["contexto_documentos"] = ""
         
         state["estructura_identificada"] = estructura_db
 
