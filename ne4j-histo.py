@@ -85,7 +85,7 @@ nest_asyncio.apply()
 # CONFIGURACIÓN GLOBAL
 # =============================================================================
 # CONFIGURACIÓN GLOBAL
-SIMILARITY_THRESHOLD  = 0.45
+SIMILARITY_THRESHOLD  = 0.70  # Aumentado de 0.45 a 0.70 para mayor precisión en imágenes médicas
 # Dimensiones de embeddings
 DIM_TEXTO        = 384
 DIM_IMG_UNI      = 1024
@@ -113,6 +113,15 @@ FEATURES_DISCRIMINATORIAS = [
     "tamaño estimado de la estructura",
     "tejido circundante (estroma, epitelio, piel, otro)",
     "reacción inflamatoria perilesional (sí/no, tipo)",
+    # Cartílago vs Hueso — features críticas
+    "tipo de matriz extracelular: homogénea/vítrea (cartílago) vs calcificada con canalículos (hueso)",
+    "células en lagunas: condrocitos (redondeados, en nidos/isógenos) vs osteocitos (estrellados, aislados con prolongaciones)",
+    "presencia de pericondrio (cartílago) vs periostio (hueso)",
+    "sistemas de Havers / osteonas (exclusivo de hueso compacto)",
+    "nidos isógenos / grupos celulares (exclusivo de cartílago)",
+    "tinción de la matriz: basófila-azulada (cartílago hialino) vs eosinófila-rosada (hueso)",
+    "fibras visibles en la matriz: ausentes (hialino), elásticas (elástico), colágenas gruesas (fibroso)",
+    "vascularización: avascular (cartílago, excepto fibrocartílago) vs muy vascularizado (hueso)",
 ]
 
 # Anclas semánticas para el clasificador de dominio
@@ -241,6 +250,45 @@ LANGSMITH_ENABLED, traceable, langsmith_client = setup_langsmith_environment()
 # WRAPPERS DE MODELOS (PLIP & UNI)
 # =============================================================================
 
+def preprocess_image_for_embedding(image_path: str) -> Image.Image:
+    """
+    Preprocess USER image before generating embeddings.
+    Applies only contrast/brightness enhancement — NO magnification.
+    
+    Las imágenes del usuario NO se magnifican porque los embeddings indexados
+    provienen de imágenes ya magnificadas durante la extracción del PDF.
+    Magnificar la imagen del usuario distorsionaría la comparación de similitud.
+    
+    Args:
+        image_path: Path to image file
+        
+    Returns:
+        Preprocessed PIL Image (same resolution, enhanced contrast/brightness)
+    """
+    try:
+        from PIL import ImageEnhance
+        
+        # Load image
+        img = Image.open(image_path).convert('RGB')
+        
+        # Apply contrast enhancement (factor 1.2)
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.2)
+        
+        # Apply brightness enhancement (factor 1.1)
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(1.1)
+        
+        # NO magnification — user images keep their original resolution
+        # to maintain comparability with indexed (already magnified) images
+        
+        return img
+        
+    except Exception as e:
+        print(f"⚠️ Error preprocessing image: {e}, using original")
+        return Image.open(image_path).convert('RGB')
+
+
 class PlipWrapper:
     def __init__(self, device):
         self.device = device
@@ -256,10 +304,15 @@ class PlipWrapper:
         except Exception as e:
             print(f"❌ Error cargando PLIP: {e}")
 
-    def embed_image(self, image_path: str) -> np.ndarray:
+    def embed_image(self, image_path: str, preprocess: bool = True) -> np.ndarray:
         if not self.model: return np.zeros(DIM_IMG_PLIP)
         try:
-            image = Image.open(image_path).convert('RGB')
+            # Apply preprocessing for user images
+            if preprocess:
+                image = preprocess_image_for_embedding(image_path)
+            else:
+                image = Image.open(image_path).convert('RGB')
+            
             inputs = self.processor(images=image, return_tensors="pt")
             pixel_values = inputs["pixel_values"].to(self.device)
             with torch.inference_mode():
@@ -298,10 +351,15 @@ class UniWrapper:
         except Exception as e:
             print(f"❌ Error cargando UNI: {e}")
 
-    def embed_image(self, image_path: str) -> np.ndarray:
+    def embed_image(self, image_path: str, preprocess: bool = True) -> np.ndarray:
         if not self.model: return np.zeros(DIM_IMG_UNI)
         try:
-            image = Image.open(image_path).convert('RGB')
+            # Apply preprocessing for user images
+            if preprocess:
+                image = preprocess_image_for_embedding(image_path)
+            else:
+                image = Image.open(image_path).convert('RGB')
+            
             image_tensor = self.transform(image).unsqueeze(0).to(self.device)
             with torch.inference_mode():
                 emb = self.model(image_tensor) # UNI returns raw features [1, 1024]
@@ -479,13 +537,16 @@ class Neo4jClient:
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str, texto_pagina: str,
                              emb_uni: List[float], emb_plip: List[float],
-                             caption: str = ""):
+                             caption: str = "", nombre_archivo: str = "",
+                             etiqueta: str = ""):
         await self.run("""
             MERGE (i:Imagen {id: $id})
             SET i.path = $path, i.fuente = $fuente,
                 i.pagina = $pagina, i.ocr_text = $ocr_text,
                 i.texto_pagina = $texto_pagina,
                 i.caption = $caption,
+                i.nombre_archivo = $nombre_archivo,
+                i.etiqueta = $etiqueta,
                 i.embedding_uni = $emb_uni,
                 i.embedding_plip = $emb_plip
             WITH i
@@ -496,7 +557,8 @@ class Neo4jClient:
         """, {
             "id": imagen_id, "path": path, "fuente": fuente,
             "pagina": pagina, "ocr_text": ocr_text, "texto_pagina": texto_pagina,
-            "caption": caption,
+            "caption": caption, "nombre_archivo": nombre_archivo,
+            "etiqueta": etiqueta,
             "emb_uni": emb_uni, "emb_plip": emb_plip
         })
 
@@ -534,27 +596,64 @@ class Neo4jClient:
                 CALL db.index.vector.queryNodes($index, $k, $emb)
                 YIELD node AS c, score
                 RETURN c.id AS id, c.texto AS texto, c.fuente AS fuente,
-                       'texto' AS tipo, null AS imagen_path, score AS similitud
+                       'texto' AS tipo, null AS imagen_path, score AS similitud,
+                       null AS nombre_archivo, null AS etiqueta
                 ORDER BY similitud DESC
             """
         else:
+             # Priorizar caption sobre ocr_text (OCR de histología es ruido)
+             # Incluir nombre_archivo y etiqueta para trazabilidad
              query = """
                 CALL db.index.vector.queryNodes($index, $k, $emb)
                 YIELD node AS i, score
                 RETURN i.id AS id, 
-                       coalesce(
-                           CASE WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption END,
-                           CASE WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text END,
-                           i.texto_pagina
-                       ) AS texto, 
+                       CASE 
+                           WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                           WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                           WHEN i.ocr_text IS NOT NULL AND i.ocr_text <> '' THEN i.ocr_text
+                           ELSE ''
+                       END AS texto, 
                        i.fuente AS fuente,
-                       'imagen' AS tipo, i.path AS imagen_path, score AS similitud
+                       'imagen' AS tipo, i.path AS imagen_path, score AS similitud,
+                       coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                       coalesce(i.etiqueta, '') AS etiqueta
                 ORDER BY similitud DESC
             """
         try:
             return await self.run(query, {"index": index_name, "emb": embedding, "k": top_k})
         except Exception as e:
             print(f"⚠️ Error búsqueda vectorial {index_name}: {e}")
+            return []
+
+    async def busqueda_chunks_por_pagina(self, fuente: str, pagina: int,
+                                          top_k: int = 3) -> List[Dict]:
+        """Recupera chunks de texto de la misma página que una imagen.
+        Esto enriquece el contexto con la descripción textual completa de la página."""
+        if not fuente or not pagina:
+            return []
+        # Los chunks no tienen página directamente, pero podemos buscar por índice
+        # Cada página tiene ~500-600 chars, un chunk es 500 chars
+        # Estimación: chunk_idx ≈ (pagina - 1) * 1.2
+        # Mejor enfoque: buscar por texto de la página en chunks
+        query = """
+            MATCH (i:Imagen {fuente: $fuente, pagina: $pagina})
+            WHERE i.texto_pagina IS NOT NULL AND i.texto_pagina <> ''
+            WITH i.texto_pagina AS pag_texto
+            MATCH (c:Chunk {fuente: $fuente})
+            WHERE c.texto IS NOT NULL 
+            AND (
+                pag_texto CONTAINS c.texto[0..100]
+                OR c.texto CONTAINS pag_texto[0..100]
+            )
+            RETURN c.id AS id, c.texto AS texto, c.fuente AS fuente,
+                   'texto' AS tipo, null AS imagen_path, 0.80 AS similitud,
+                   null AS nombre_archivo, null AS etiqueta
+            LIMIT $top_k
+        """
+        try:
+            return await self.run(query, {"fuente": fuente, "pagina": pagina, "top_k": top_k})
+        except Exception as e:
+            print(f"⚠️ Error búsqueda chunks por página: {e}")
             return []
 
     async def busqueda_por_entidades(self, entidades: Dict[str, List[str]],
@@ -637,11 +736,13 @@ class Neo4jClient:
             RETURN DISTINCT
                 v.id AS id,
                 CASE 
-                    WHEN v:Imagen THEN coalesce(
-                        CASE WHEN v.caption IS NOT NULL AND v.caption <> '' THEN v.caption END,
-                        CASE WHEN v.ocr_text IS NOT NULL AND v.ocr_text <> '' THEN v.ocr_text END,
-                        v.texto_pagina, ''
-                    )
+                    WHEN v:Imagen THEN 
+                        CASE 
+                            WHEN v.caption IS NOT NULL AND v.caption <> '' THEN v.caption
+                            WHEN v.texto_pagina IS NOT NULL AND v.texto_pagina <> '' THEN v.texto_pagina
+                            WHEN v.ocr_text IS NOT NULL AND v.ocr_text <> '' THEN v.ocr_text
+                            ELSE ''
+                        END
                     ELSE coalesce(v.texto, '') 
                 END AS texto,
                 v.fuente AS fuente,
@@ -652,7 +753,9 @@ class Neo4jClient:
                          (n:Chunk AND v:Imagen AND n.fuente = v.fuente)
                     THEN 0.95 
                     ELSE 0.3 
-                END AS similitud
+                END AS similitud,
+                CASE WHEN v:Imagen THEN coalesce(v.nombre_archivo, '') ELSE '' END AS nombre_archivo,
+                CASE WHEN v:Imagen THEN coalesce(v.etiqueta, '') ELSE '' END AS etiqueta
             LIMIT 15
         """
         try:
@@ -716,11 +819,17 @@ class Neo4jClient:
                 toLower(coalesce(i.caption,'')) CONTAINS t
             )
             RETURN i.id AS id,
-                   coalesce(i.caption, i.ocr_text, i.texto_pagina) AS texto,
+                   CASE 
+                       WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                       WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                       ELSE coalesce(i.ocr_text, '')
+                   END AS texto,
                    i.fuente AS fuente,
                    'imagen' AS tipo,
                    i.path AS imagen_path,
-                   0.5 AS similitud
+                   0.5 AS similitud,
+                   coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                   coalesce(i.etiqueta, '') AS etiqueta
             LIMIT $top_k
         """
         
@@ -745,11 +854,17 @@ class Neo4jClient:
                 toLower(coalesce(i.caption,'')) CONTAINS t
             )
             RETURN DISTINCT i.id AS id,
-                   coalesce(i.caption, i.ocr_text, i.texto_pagina) AS texto,
+                   CASE 
+                       WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                       WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                       ELSE coalesce(i.ocr_text, '')
+                   END AS texto,
                    i.fuente AS fuente,
                    'imagen' AS tipo,
                    i.path AS imagen_path,
-                   0.45 AS similitud
+                   0.45 AS similitud,
+                   coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                   coalesce(i.etiqueta, '') AS etiqueta
             LIMIT $top_k
         """
         try:
@@ -794,37 +909,67 @@ class Neo4jClient:
         if top_ids:
             res_vec = await self.expandir_vecindad(top_ids)
 
+        # Cross-reference: para imagen matches fuertes, traer chunks de la misma página
+        res_pag_chunks = []
+        tiene_imagen = imagen_embedding_uni is not None or imagen_embedding_plip is not None
+        if tiene_imagen:
+            top_img_results = [r for r in (res_uni + res_plip) if r.get("similitud", 0) > 0.75]
+            for img_r in top_img_results[:3]:
+                fuente = img_r.get("fuente", "")
+                # Recuperar página del match
+                try:
+                    pag_info = await self.run(
+                        "MATCH (i:Imagen {id: $id}) RETURN i.pagina AS pagina",
+                        {"id": img_r.get("id")}
+                    )
+                    if pag_info and pag_info[0].get("pagina"):
+                        chunks_pag = await self.busqueda_chunks_por_pagina(
+                            fuente, pag_info[0]["pagina"]
+                        )
+                        res_pag_chunks.extend(chunks_pag)
+                except Exception:
+                    pass
+
         combined: Dict[str, Dict] = {}
 
-        def agregar(resultados: List[Dict], peso: float):
+        def agregar(resultados: List[Dict], peso: float, es_visual: bool = False):
             for r in resultados:
                 key = r.get("id") or f"{r.get('fuente')}_{str(r.get('texto',''))[:40]}"
                 if not r.get("texto") and not r.get("imagen_path"):
                     continue
-                sim_ponderada = r.get("similitud", 0) * peso
+                
+                sim = r.get("similitud", 0)
+                sim_ponderada = sim * peso
+                
+                # Boost masivo para matches visuales casi exactos
+                # Evita que entidades alucinadas le ganen a la imagen correcta
+                if es_visual and sim > 0.95:
+                    sim_ponderada += 2.0
+                    
                 if key not in combined:
                     combined[key] = {**r, "similitud": sim_ponderada}
                 else:
                     combined[key]["similitud"] += sim_ponderada
 
         # Pesos dinámicos según modo de consulta (Fix #5)
-        tiene_imagen = imagen_embedding_uni is not None or imagen_embedding_plip is not None
         if tiene_imagen:
             agregar(res_texto, 0.40)  # Texto complementa cuando hay imagen
-            agregar(res_uni,   0.70)  # UNI domina visual
-            agregar(res_plip,  0.70)  # PLIP domina visual
+            agregar(res_uni,   0.70, es_visual=True)  # UNI domina visual
+            agregar(res_plip,  0.70, es_visual=True)  # PLIP domina visual
             agregar(res_ent,   0.60)  # Entidades siempre importantes
+            agregar(res_pag_chunks, 0.50)  # Chunks de la misma página que la imagen matcheada
         else:
             agregar(res_texto, 0.80)  # Texto domina sin imagen
-            agregar(res_uni,   0.20)  # UNI poco relevante sin query visual
-            agregar(res_plip,  0.20)  # PLIP poco relevante sin query visual
+            agregar(res_uni,   0.20, es_visual=True)  # UNI poco relevante sin query visual
+            agregar(res_plip,  0.20, es_visual=True)  # PLIP poco relevante sin query visual
             agregar(res_ent,   0.60)  # Entidades siempre importantes
         agregar(res_vec,   0.20)
 
         final = sorted(combined.values(), key=lambda x: x["similitud"], reverse=True)
 
         print(f"   📊 Híbrida: Txt={len(res_texto)} | "
-              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | Vec={len(res_vec)} -> {len(final)}")
+              f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
+              f"Vec={len(res_vec)} | PagCtx={len(res_pag_chunks)} -> {len(final)}")
 
         return final[:15]
 
@@ -854,6 +999,7 @@ class SemanticMemory:
         # Persistencia de imagen entre turnos
         self.imagen_activa_path: Optional[str] = None
         self.imagen_turno_subida: int = 0
+        self.analisis_visual_activo: Optional[str] = None
         self.turno_actual: int = 0
         
         # Qdrant init
@@ -885,14 +1031,16 @@ class SemanticMemory:
                 }
             )
 
-    def set_imagen(self, path: Optional[str]):
+    def set_imagen(self, path: Optional[str], analisis_visual: Optional[str] = None):
         """Registra una nueva imagen activa. None = limpiar."""
         if path and os.path.exists(path):
             self.imagen_activa_path  = path
             self.imagen_turno_subida = self.turno_actual
+            self.analisis_visual_activo = analisis_visual
             print(f"   📌 Imagen activa registrada (turno {self.turno_actual}): {path}")
         elif path is None:
             self.imagen_activa_path = None
+            self.analisis_visual_activo = None
             print("   🗑️  Imagen activa limpiada")
 
     def get_imagen_activa(self) -> Optional[str]:
@@ -950,9 +1098,10 @@ class SemanticMemory:
             emb_plip = [0.0] * DIM_IMG_PLIP
             if self.imagen_activa_path and os.path.exists(self.imagen_activa_path):
                 if self.uni:
-                    emb_uni = self.uni.embed_image(self.imagen_activa_path).tolist()
+                    # Memory images: apply preprocessing for consistency
+                    emb_uni = self.uni.embed_image(self.imagen_activa_path, preprocess=True).tolist()
                 if self.plip:
-                    emb_plip = self.plip.embed_image(self.imagen_activa_path).tolist()
+                    emb_plip = self.plip.embed_image(self.imagen_activa_path, preprocess=True).tolist()
 
             point = PointStruct(
                 id=str(uuid.uuid4()),
@@ -1184,49 +1333,197 @@ Responde ÚNICAMENTE en JSON válido (sin backticks):
 # EXTRACTOR DE IMÁGENES DE PDF
 # =============================================================================
 
-class ExtractorImagenesPDF:
-    MIN_WIDTH  = 200
-    MIN_HEIGHT = 200
+class ImageExtractionConfig:
+    """Configuration for image extraction and preprocessing."""
+    
+    # Size thresholds
+    MIN_WIDTH: int = 150
+    MIN_HEIGHT: int = 150
+    TARGET_MAGNIFICATION_SIZE: int = 868
+    
+    # Enhancement settings
+    ENHANCE_CONTRAST: bool = True
+    ENHANCE_BRIGHTNESS: bool = True
+    CONTRAST_FACTOR: float = 1.2
+    BRIGHTNESS_FACTOR: float = 1.1
+    
+    # Fallback settings
+    FALLBACK_DPI: int = 150
+    
+    # Resampling
+    RESAMPLING_ALGORITHM = Image.Resampling.LANCZOS
 
-    def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES):
+
+class ExtractorImagenesPDF:
+    def __init__(self, directorio_salida: str = DIRECTORIO_IMAGENES, config: Optional[ImageExtractionConfig] = None):
         self.directorio_salida = directorio_salida
+        self.config = config if config is not None else ImageExtractionConfig()
         os.makedirs(directorio_salida, exist_ok=True)
+
+    def _apply_preprocessing(self, image: Image.Image) -> Image.Image:
+        """
+        Apply preprocessing enhancements to image.
+        
+        Applies contrast enhancement followed by brightness enhancement
+        based on configuration settings.
+        
+        Args:
+            image: PIL Image object
+            
+        Returns:
+            Enhanced PIL Image object, or original if preprocessing fails
+        """
+        try:
+            from PIL import ImageEnhance
+            
+            enhanced = image
+            
+            # Apply contrast enhancement first
+            if self.config.ENHANCE_CONTRAST:
+                enhancer = ImageEnhance.Contrast(enhanced)
+                enhanced = enhancer.enhance(self.config.CONTRAST_FACTOR)
+                
+            # Apply brightness enhancement second
+            if self.config.ENHANCE_BRIGHTNESS:
+                enhancer = ImageEnhance.Brightness(enhanced)
+                enhanced = enhancer.enhance(self.config.BRIGHTNESS_FACTOR)
+                
+            return enhanced
+            
+        except Exception as e:
+            print(f"  ⚠️ Preprocessing failed: {e}, using original image")
+            return image
+
+    def _apply_magnification(self, image: Image.Image) -> Image.Image:
+        """
+        Magnify image to target size if below threshold.
+        
+        Magnification rules:
+        - If width < 868: scale to width=868, preserve aspect ratio
+        - Else if height < 868: scale to height=868, preserve aspect ratio
+        - Else: no magnification needed
+        
+        Args:
+            image: PIL Image object
+            
+        Returns:
+            Magnified PIL Image object (or original if no magnification needed)
+        """
+        w, h = image.size
+        target = self.config.TARGET_MAGNIFICATION_SIZE
+        
+        # Check if magnification is needed
+        if w >= target and h >= target:
+            return image
+            
+        # Calculate new dimensions
+        if w < target:
+            # Scale based on width
+            new_w = target
+            new_h = int(h * (target / w))
+            print(f"  🔍 Magnifying: {w}x{h} → {new_w}x{new_h} (width-based)")
+        else:
+            # Scale based on height (w >= target but h < target)
+            new_h = target
+            new_w = int(w * (target / h))
+            print(f"  🔍 Magnifying: {w}x{h} → {new_w}x{new_h} (height-based)")
+            
+        # Apply magnification with LANCZOS resampling
+        return image.resize((new_w, new_h), self.config.RESAMPLING_ALGORITHM)
+
+    def _fallback_render_page(self, pdf_path: str, page_num: int) -> Optional[Image.Image]:
+        """
+        Render PDF page as image using pdf2image fallback.
+        
+        Args:
+            pdf_path: Path to PDF file
+            page_num: Page number (1-indexed)
+            
+        Returns:
+            PIL Image object or None if rendering fails
+        """
+        try:
+            from pdf2image import convert_from_path
+            
+            print(f"  🔄 Fallback: rendering page {page_num} with pdf2image")
+            
+            pag_imgs = convert_from_path(
+                pdf_path,
+                first_page=page_num,
+                last_page=page_num,
+                dpi=self.config.FALLBACK_DPI
+            )
+            
+            if pag_imgs:
+                return pag_imgs[0]
+            return None
+            
+        except Exception as e:
+            print(f"  ❌ Fallback rendering failed for page {page_num}: {e}")
+            return None
+
+    @staticmethod
+    def _extraer_etiqueta_imagen(texto: str) -> str:
+        """Busca la etiqueta formal de la imagen (Imagen X.X, Fig X.X, Figura X.X)
+        en el texto y la devuelve. Devuelve cadena vacía si no encuentra."""
+        if not texto:
+            return ""
+        patrones = [
+            r'(Imagen\s+\d+[\.]?\d*[A-Za-z]?)',
+            r'(Fig(?:ura)?\.?\s*\d+[\.]?\d*[A-Za-z]?)',
+            r'(Lámina\s+\d+[\.]?\d*[A-Za-z]?)',
+            r'(Foto(?:grafía)?\s+\d+[\.]?\d*[A-Za-z]?)',
+        ]
+        for patron in patrones:
+            match = re.search(patron, texto, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
 
     @staticmethod
     def extraer_caption_imagen(page_fitz, img_bbox, texto_pagina_completo: str) -> str:
-        """Extrae el texto más cercano espacialmente a la imagen (caption).
-        Busca primero debajo (caption típico), luego arriba.
-        También busca referencias 'Fig. X' / 'Imagen X' en el texto."""
+        """Extrae la etiqueta 'Imagen X.X' / 'Fig X.X' + TODO el texto debajo
+        de la imagen hasta el final de la página.
+        
+        Estrategia:
+        1. Buscar texto desde ligeramente ARRIBA del borde inferior de la imagen
+           (para capturar etiquetas que se solapan con el bbox) hasta el final.
+        2. Si no se encontró etiqueta, buscar desde justo debajo.
+        3. Siempre devolver el caption completo (etiqueta + descripción).
+        """
         caption = ""
         try:
-            # Área de búsqueda: debajo de la imagen (hasta 80 puntos)
-            area_abajo = fitz.Rect(
-                img_bbox[0], img_bbox[3],
-                img_bbox[2], img_bbox[3] + 80
+            page_rect = page_fitz.rect
+            
+            # Paso 1: Buscar con margen hacia arriba (10px) para capturar
+            # etiquetas que solapan con el borde inferior de la imagen
+            margen_overlap = 10  # pixels de margen
+            area_expandida = fitz.Rect(
+                0,
+                max(0, img_bbox[3] - margen_overlap),
+                page_rect.width,
+                page_rect.height
             )
-            caption = page_fitz.get_text("text", clip=area_abajo).strip()
-            if not caption:
-                # Buscar arriba de la imagen (hasta 60 puntos)
-                area_arriba = fitz.Rect(
-                    img_bbox[0], max(0, img_bbox[1] - 60),
-                    img_bbox[2], img_bbox[1]
+            texto_expandido = page_fitz.get_text("text", clip=area_expandida).strip()
+            
+            if texto_expandido:
+                caption = texto_expandido
+            else:
+                # Paso 2: Buscar desde justo debajo sin margen
+                area_abajo = fitz.Rect(
+                    0,
+                    img_bbox[3],
+                    page_rect.width,
+                    page_rect.height
                 )
-                caption = page_fitz.get_text("text", clip=area_arriba).strip()
+                caption = page_fitz.get_text("text", clip=area_abajo).strip()
         except Exception:
             pass
-        # Buscar referencias "Fig. X" / "Imagen X" en el texto
-        referencias = re.findall(
-            r'(?:Fig(?:ura)?\.?\s*\d+[A-Za-z]?[^.]*\.)|(?:Imagen\s+\d+[\.\d]*[^.]*\.)',
-            texto_pagina_completo,
-            re.IGNORECASE
-        )
-        partes = []
+        
         if caption:
-            partes.append(caption)
-        if referencias:
-            partes.extend(referencias[:3])
-        if partes:
-            return "\n".join(partes)
+            # Limpiar: remover números de página sueltos al final
+            caption = re.sub(r'\n\s*\d{1,3}\s*$', '', caption).strip()
+            return caption
         # Fallback: primeros 500 chars del texto de la página
         return texto_pagina_completo[:500] if texto_pagina_completo else ""
 
@@ -1270,7 +1567,7 @@ class ExtractorImagenesPDF:
                             pil_temp = Image.open(BytesIO(image_bytes))
                             w, h = pil_temp.size
                             
-                            if w >= self.MIN_WIDTH and h >= self.MIN_HEIGHT:
+                            if w >= self.config.MIN_WIDTH and h >= self.config.MIN_HEIGHT:
                                 valid_images_this_page.append({
                                     "pil": pil_temp,
                                     "area": w * h,
@@ -1286,6 +1583,13 @@ class ExtractorImagenesPDF:
                 mejor = max(valid_images_this_page, key=lambda x: x["area"])
                 pil_img = mejor["pil"]
                 img_bbox = mejor.get("bbox")
+                
+                # Apply preprocessing pipeline
+                pil_img = self._apply_preprocessing(pil_img)
+                
+                # Apply magnification logic
+                pil_img = self._apply_magnification(pil_img)
+                
                 nombre_archivo = f"{nombre_pdf}_pag{num_pagina}.png"
                 ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
                 
@@ -1302,23 +1606,36 @@ class ExtractorImagenesPDF:
                     if img_bbox:
                         caption = self.extraer_caption_imagen(pagina, img_bbox, texto_completo_pagina)
 
+                    # Extraer etiqueta formal ("Imagen 15.5", "Fig 3A")
+                    etiqueta = self._extraer_etiqueta_imagen(caption)
+                    if not etiqueta:
+                        etiqueta = self._extraer_etiqueta_imagen(texto_completo_pagina)
+
                     imagenes_extraidas.append({
                         "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
                         "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
                         "texto_pagina": texto_completo_pagina,
-                        "caption": caption
+                        "caption": caption,
+                        "nombre_archivo": nombre_archivo,
+                        "etiqueta": etiqueta
                     })
                 except Exception as e:
                     print(f"  ⚠️ Error guardando pág {num_pagina}: {e}")
             else:
                 # FALLBACK: No hay imágenes o son muy chicas -> Renderizar página completa
-                try:
-                    from pdf2image import convert_from_path
-                    pag_imgs = convert_from_path(pdf_path, first_page=num_pagina, last_page=num_pagina, dpi=150)
-                    if pag_imgs:
-                        pil_full = pag_imgs[0]
-                        nombre_archivo = f"{nombre_pdf}_pag{num_pagina}_full.png"
-                        ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+                pil_full = self._fallback_render_page(pdf_path, num_pagina)
+                
+                if pil_full:
+                    # Apply preprocessing pipeline to fallback image
+                    pil_full = self._apply_preprocessing(pil_full)
+                    
+                    # Apply magnification logic to fallback image
+                    pil_full = self._apply_magnification(pil_full)
+                    
+                    nombre_archivo = f"{nombre_pdf}_pag{num_pagina}_full.png"
+                    ruta_completa  = os.path.join(self.directorio_salida, nombre_archivo)
+                    
+                    try:
                         pil_full.save(ruta_completa, format="PNG")
                         
                         try:
@@ -1334,14 +1651,20 @@ class ExtractorImagenesPDF:
                         )
                         caption_fb = "\n".join(refs[:3]) if refs else ""
 
+                        etiqueta_fb = self._extraer_etiqueta_imagen(caption_fb)
+                        if not etiqueta_fb:
+                            etiqueta_fb = self._extraer_etiqueta_imagen(texto_completo_pagina)
+
                         imagenes_extraidas.append({
                             "path": ruta_completa, "fuente_pdf": os.path.basename(pdf_path),
                             "pagina": num_pagina, "indice": 1, "ocr_text": ocr_text,
                             "texto_pagina": texto_completo_pagina,
-                            "caption": caption_fb
+                            "caption": caption_fb,
+                            "nombre_archivo": nombre_archivo,
+                            "etiqueta": etiqueta_fb
                         })
-                except Exception as e:
-                    print(f"  ⚠️ Fallback error pág {num_pagina}: {e}")
+                    except Exception as e:
+                        print(f"  ⚠️ Error guardando fallback pág {num_pagina}: {e}")
 
         doc.close()
         print(f"  📸 {len(imagenes_extraidas)} imágenes procesadas de {os.path.basename(pdf_path)}")
@@ -1825,12 +2148,13 @@ class AsistenteHistologiaNeo4j:
         if imagen_path_nuevo and os.path.exists(imagen_path_nuevo):
             imagen_path_activo = imagen_path_nuevo
             imagen_es_nueva    = True
-            self.memoria.set_imagen(imagen_path_activo)
+            # Se registrará en la memoria con su análisis después de generarlo
             print(f"   🆕 Nueva imagen: {imagen_path_activo}")
 
         elif self.memoria.tiene_imagen_previa():
             imagen_path_activo = self.memoria.get_imagen_activa()
             state["imagen_path"] = imagen_path_activo
+            state["analisis_visual"] = self.memoria.analisis_visual_activo
             print(f"   ♻️  Reutilizando imagen del turno "
                   f"{self.memoria.imagen_turno_subida}: "
                   f"{os.path.basename(imagen_path_activo)}")
@@ -1840,9 +2164,9 @@ class AsistenteHistologiaNeo4j:
 
         if imagen_path_activo and os.path.exists(imagen_path_activo):
             try:
-                # emb_c removed
-                emb_u = self.uni.embed_image(imagen_path_activo)
-                emb_p = self.plip.embed_image(imagen_path_activo)
+                # User images: apply preprocessing for consistency with indexed images
+                emb_u = self.uni.embed_image(imagen_path_activo, preprocess=True)
+                emb_p = self.plip.embed_image(imagen_path_activo, preprocess=True)
                 
                 state["imagen_embedding_uni"]   = emb_u.tolist()
                 state["imagen_embedding_plip"]  = emb_p.tolist()
@@ -1854,6 +2178,8 @@ class AsistenteHistologiaNeo4j:
                     state["analisis_visual"] = await self._describir_imagen_histologica(
                         imagen_path_activo
                     )
+                    # Guardar en memoria para que persista entre turnos
+                    self.memoria.set_imagen(imagen_path_activo, state["analisis_visual"])
                     print(f"   🔬 Análisis visual generado ({len(state['analisis_visual'])} chars)")
                 else:
                     print("   ♻️  Reutilizando análisis visual previo del contexto")
@@ -1892,11 +2218,22 @@ class AsistenteHistologiaNeo4j:
             )
             msg = HumanMessage(content=[
                 {"type": "text", "text": (
-                    "Describe esta imagen histológica.\n\n"
-                    "PARTE 1 — DESCRIPCIÓN GENERAL: tipo tejido, coloración, aumento, estructuras.\n\n"
+                    "Describe esta imagen histológica con máximo rigor.\n\n"
+                    "PARTE 1 — DESCRIPCIÓN OBJETIVA (sin nombrar el tejido aún):\n"
+                    "Describí SOLO lo que ves: coloración de la matriz, forma y disposición "
+                    "de las células, presencia/ausencia de canalículos, vasos sanguíneos, "
+                    "fibras visibles, capas envolventes. NO clasifiques todavía.\n\n"
                     f"PARTE 2 — FEATURES DISCRIMINATORIAS:\n{features_lista}\n\n"
-                    "PARTE 3 — DIAGNÓSTICO DIFERENCIAL: 3 estructuras más probables, "
-                    "diferencias morfológicas, ¿confundible con cuerpo de albicans?"
+                    "PARTE 3 — DIAGNÓSTICO DIFERENCIAL (mínimo 3 opciones):\n"
+                    "⚠️ ERRORES COMUNES A EVITAR:\n"
+                    "- Cartílago hialino vs Tejido óseo: ambos tienen células en lagunas, "
+                    "pero el cartílago tiene matriz VÍTREA/HOMOGÉNEA basófila y condrocitos "
+                    "en NIDOS ISÓGENOS, mientras que el hueso tiene matriz CALCIFICADA con "
+                    "CANALÍCULOS y osteocitos AISLADOS con prolongaciones.\n"
+                    "- Cartílago hialino vs elástico vs fibroso: diferenciar por fibras en la matriz.\n"
+                    "- Si ves lagunas con células redondeadas en grupos y matriz homogénea "
+                    "sin canalículos ni osteonas, es CARTÍLAGO, no hueso.\n\n"
+                    "Para cada opción, listá las evidencias a favor y en contra."
                 )},
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
             ])
@@ -1916,15 +2253,16 @@ class AsistenteHistologiaNeo4j:
         print("🔍 Clasificando consulta (semántico v4.1)...")
 
         # ── Extracción de términos ─────────────────────────────────────
+        # SOLO extraer de la consulta del usuario y contexto de memoria.
+        # NO incluir analisis_visual: es la interpretación del LLM sobre la imagen
+        # y pre-clasificaría el tejido antes de buscarlo (sesga la búsqueda textual).
+        # La búsqueda visual se hace por embeddings UNI/PLIP, no por texto.
         system = (
             "Extrae términos técnicos histológicos de la consulta.\n"
             "Devuelve:\nTEJIDO: [...]\nESTRUCTURA: [...]\nCONCEPTO: [...]\n"
             "TINCIÓN: [...]\nTÉRMINOS_CLAVE: [...]"
         )
         partes = [f"CONSULTA:\n{state['consulta_texto']}"]
-        analisis_visual = _safe(state.get("analisis_visual"))
-        if analisis_visual:
-            partes.append(f"ANÁLISIS VISUAL:\n{analisis_visual[:600]}")
         contexto_mem = _safe(state.get("contexto_memoria"))
         if contexto_mem and contexto_mem != "No hay consultas previas.":
             partes.append(f"CONTEXTO:\n{contexto_mem[:300]}")
@@ -1939,11 +2277,12 @@ class AsistenteHistologiaNeo4j:
             state["terminos_busqueda"] = state["consulta_texto"]
 
         # ── Entidades para búsqueda por grafo ──────────────────────────
-        texto_para_entidades = (
-            state["consulta_texto"] + " " + _safe(state.get("analisis_visual"))
-        )
+        # SOLO extraer entidades de la consulta del usuario.
+        # NO incluir analisis_visual porque es una interpretación del LLM
+        # que puede alucinar (ej: confundir cartílago con hueso) y
+        # contaminar la búsqueda con entidades incorrectas.
         state["entidades_consulta"] = await self.extractor_entidades.extraer_de_texto(
-            texto_para_entidades
+            state["consulta_texto"]
         )
         print(f"   🏷️ Entidades: {state['entidades_consulta']}")
 
@@ -2112,7 +2451,10 @@ class AsistenteHistologiaNeo4j:
             validos_sorted = sorted(validos, key=lambda x: x.get("similitud", 0), reverse=True)
             bloques = []
             for i, r in enumerate(validos_sorted, 1):
-                enc = (f"[Sección {i} | Fuente: {r.get('fuente','N/A')} | "
+                # Marcar el resultado #1 de imagen como MEJOR MATCH VISUAL
+                es_top_imagen = (i == 1 and r.get('tipo') == 'imagen')
+                marcador = " ⭐ MEJOR MATCH VISUAL" if es_top_imagen else ""
+                enc = (f"[Sección {i}{marcador} | Fuente: {r.get('fuente','N/A')} | "
                        f"Tipo: {r.get('tipo','?')} | Sim: {r.get('similitud',0):.3f}")
                 if r.get("imagen_path"):
                     enc += f" | Imagen: {os.path.basename(r['imagen_path'])}"
@@ -2221,13 +2563,33 @@ class AsistenteHistologiaNeo4j:
         try:
             resp = await invoke_con_reintento(self.llm, [HumanMessage(content=content_parts)])
             state["analisis_comparativo"] = resp.content
-            state["estructura_identificada"] = await self._extraer_estructura(resp.content)
             print(f"✅ Análisis comparativo: {len(resp.content)} chars")
-            print(f"   → Estructura: {state['estructura_identificada']}")
         except Exception as e:
             print(f"❌ Error análisis comparativo: {e}")
             state["analisis_comparativo"] = None
-            state["estructura_identificada"] = None
+
+        # Extraer estructura_identificada del CAPTION DE LA DB (top visual match),
+        # NO de la interpretación del LLM. La DB es la fuente de verdad:
+        # si la imagen más similar en la DB tiene caption "Tejido Óseo",
+        # eso es lo que es, sin importar lo que el LLM crea ver.
+        estructura_db = None
+        imagenes_texto = state.get("imagenes_texto_map", {})
+        imagenes_rec = state.get("imagenes_recuperadas", [])
+        if imagenes_rec and imagenes_texto:
+            top_match_path = imagenes_rec[0]  # Imagen con mayor similitud visual
+            top_caption = imagenes_texto.get(top_match_path, "")
+            if top_caption:
+                # Extraer la estructura del título del caption (primera línea)
+                primera_linea = top_caption.split('\n')[0].strip()
+                # Buscar patrón "Imagen X.X. <descripción>"
+                match = re.match(r'Imagen\s+[\d.]+[A-Za-z]?\.\s*(.*)', primera_linea)
+                if match:
+                    estructura_db = match.group(1).rstrip('.')
+                else:
+                    estructura_db = primera_linea
+                print(f"   → Estructura (DB): {estructura_db} [de {os.path.basename(top_match_path)}]")
+        
+        state["estructura_identificada"] = estructura_db
 
         state["trayectoria"].append({
             "nodo": "AnalisisComparativo", "refs": len(imagenes_ref),
@@ -2247,6 +2609,7 @@ class AsistenteHistologiaNeo4j:
             return resp.content.strip()
         except Exception:
             return None
+
 
     async def _nodo_generar_respuesta(self, state: AgentState) -> AgentState:
         t0 = time.time()
@@ -2315,6 +2678,25 @@ class AsistenteHistologiaNeo4j:
         
         instruccion_imagenes = ""
 
+        # ── Variables del estado necesarias para el system prompt ───────
+        analisis_comp_str   = _safe(state.get("analisis_comparativo"))
+        estructura_str      = _safe(state.get("estructura_identificada"))
+        analisis_visual_str = _safe(state.get("analisis_visual"), "No disponible")
+        contexto_mem_str    = _safe(state.get("contexto_memoria"))
+        terminos_str        = _safe(state.get("terminos_busqueda"))
+        tema_str            = _safe(state.get("tema_encontrado"), "N/A")
+        entidades_str       = json.dumps(state.get("entidades_consulta", {}), ensure_ascii=False)
+
+        # Instrucción extra si el análisis comparativo ya identificó la estructura
+        instruccion_estructura = ""
+        if estructura_str:
+            instruccion_estructura = (
+                f"\n⚠️ ESTRUCTURA IDENTIFICADA POR ANÁLISIS COMPARATIVO: {estructura_str}\n"
+                "Esta identificación proviene de una comparación directa imagen-vs-referencia "
+                "y tiene MÁXIMA PRIORIDAD. Usá la descripción del manual CORRESPONDIENTE A ESTA "
+                "ESTRUCTURA. Ignorá descripciones de otras imágenes que hablen de tejidos diferentes.\n"
+            )
+
         # ── System prompt diferenciado según modo ──────────────────────
         if es_solo_texto:
             system_prompt = (
@@ -2350,11 +2732,16 @@ class AsistenteHistologiaNeo4j:
                 "1. PRIORIDAD ABSOLUTA: La DESCRIPCIÓN TEXTUAL DEL MANUAL es la fuente de verdad. "
                    "Si el texto del manual dice 'Tejido nervioso corteza cerebelosa', ESO es lo correcto, "
                    "sin importar tu propia interpretación visual de la imagen.\n"
+                "   ATENCIÓN: Si se proporciona una 'ESTRUCTURA IDENTIFICADA' por el análisis comparativo, "
+                   "esa estructura es el resultado de una comparación directa imagen-vs-referencia y tiene "
+                   "MÁXIMA PRIORIDAD. Usá la descripción del manual CORRESPONDIENTE A ESA ESTRUCTURA, "
+                   "no la descripción de otras imágenes recuperadas.\n"
                 "2. Cita: [Manual: archivo] | [Imagen: archivo]\n"
                 "3. Para cada 'IMAGEN DE REFERENCIA', indica el nombre y la descripción textual del manual.\n"
                 "4. NO hagas diagnósticos propios basados en tu interpretación visual. "
                    "Usa SIEMPRE el texto del manual asociado a la imagen.\n"
                 "5. No diagnósticos clínicos salvo que estén explícitos.\n\n"
+                f"{instruccion_estructura}"
                 f"{instruccion_prosa}"
                 f"{instruccion_continuidad}"
                 f"{instruccion_imagenes}"
@@ -2362,14 +2749,6 @@ class AsistenteHistologiaNeo4j:
                 f"{regla_validacion}"
                 f"{nota_comp}"
             )
-
-        analisis_comp_str   = _safe(state.get("analisis_comparativo"))
-        estructura_str      = _safe(state.get("estructura_identificada"))
-        analisis_visual_str = _safe(state.get("analisis_visual"), "No disponible")
-        contexto_mem_str    = _safe(state.get("contexto_memoria"))
-        terminos_str        = _safe(state.get("terminos_busqueda"))
-        tema_str            = _safe(state.get("tema_encontrado"), "N/A")
-        entidades_str       = json.dumps(state.get("entidades_consulta", {}), ensure_ascii=False)
 
         seccion_comp = (f"\n\n**ANÁLISIS COMPARATIVO:**\n{analisis_comp_str[:2000]}"
                         if analisis_comp_str else "")
@@ -2572,10 +2951,18 @@ class AsistenteHistologiaNeo4j:
             if not os.path.exists(img_path):
                 continue
             try:
-                emb_u  = self.uni.embed_image(img_path)
-                emb_p  = self.plip.embed_image(img_path)
+                # Images from PDF extraction are already preprocessed, don't preprocess again
+                emb_u  = self.uni.embed_image(img_path, preprocess=False)
+                emb_p  = self.plip.embed_image(img_path, preprocess=False)
                 
                 img_id = f"img_{img_info['fuente_pdf']}_{img_info['pagina']}"
+                
+                nombre_archivo = img_info.get("nombre_archivo", os.path.basename(img_path))
+                etiqueta = img_info.get("etiqueta", "")
+                caption = img_info.get("caption", "")
+                
+                # Log de la imagen para trazabilidad
+                print(f"  📷 {nombre_archivo} | Etiqueta: {etiqueta or 'N/A'} | Caption: {len(caption)} chars")
                 
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path,
@@ -2584,7 +2971,9 @@ class AsistenteHistologiaNeo4j:
                     texto_pagina=img_info.get("texto_pagina", ""),
                     emb_uni=emb_u.tolist(),
                     emb_plip=emb_p.tolist(),
-                    caption=img_info.get("caption", "")
+                    caption=caption,
+                    nombre_archivo=nombre_archivo,
+                    etiqueta=etiqueta
                 )
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
@@ -2600,8 +2989,9 @@ class AsistenteHistologiaNeo4j:
                 except Exception:
                     pass
                 img_id = f"img_extra_{os.path.basename(img_path)}"
-                emb_u = self.uni.embed_image(img_path)
-                emb_p = self.plip.embed_image(img_path)
+                # Extra images are not preprocessed, apply preprocessing
+                emb_u = self.uni.embed_image(img_path, preprocess=True)
+                emb_p = self.plip.embed_image(img_path, preprocess=True)
                 await self.neo4j.upsert_imagen(
                     imagen_id=img_id, path=img_path, fuente=os.path.basename(img_path),
                     pagina=0, ocr_text=ocr[:300], texto_pagina="", emb_uni=emb_u.tolist(), emb_plip=emb_p.tolist()

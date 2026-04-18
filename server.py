@@ -209,115 +209,10 @@ async def post_chat(req: ChatRequest):
 
         # Leer resultado directo del asistente (más confiable que el archivo JSON)
         resultado_directo = getattr(asistente, '_ultimo_resultado', {})
-        mostrar_imgs = resultado_directo.get("mostrar_imagenes", False)
-        imagenes_rec_directas = resultado_directo.get("imagenes_recuperadas", [])
         estructura = resultado_directo.get("estructura_identificada")
 
-        # Convertir imágenes recuperadas a base64 para el frontend
+        # Imágenes deshabilitadas en el chat
         imagenes_b64 = []
-        for img_path in imagenes_rec_directas[:1]:  # Solo la de mayor similitud
-            if img_path and os.path.exists(img_path):
-                try:
-                    with open(img_path, "rb") as f:
-                        data_b64 = base64.b64encode(f.read()).decode("utf-8")
-                    ext = os.path.splitext(img_path)[1].lower()
-                    mime = "image/png" if ext == ".png" else "image/jpeg"
-                    imagenes_b64.append({
-                        "filename": os.path.basename(img_path),
-                        "base64": data_b64,
-                        "mime_type": mime
-                    })
-                except Exception as e:
-                    print(f"⚠️ Error leyendo imagen {img_path}: {e}")
-
-        # Solo buscar imagen en Neo4j si el usuario la pidió explícitamente
-        if not imagenes_b64 and mostrar_imgs and hasattr(asistente, 'neo4j') and asistente.neo4j:
-            import re
-            import unicodedata
-            
-            def sin_tildes(s):
-                return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
-            
-            # Extraer términos de búsqueda de la consulta original
-            palabras_ignorar = {"imagen", "imagenes", "foto", "mostrame", "mostra", "quiero",
-                               "dame", "pasame", "una", "ver", "del", "las", "los", "que", "como"}
-            terminos = [w.strip().lower() for w in req.query.split() 
-                       if len(w.strip()) > 3 and w.strip().lower() not in palabras_ignorar]
-            # Agregar variantes sin tildes
-            terminos_expandidos = list(set(terminos + [sin_tildes(t) for t in terminos]))
-            
-            if terminos_expandidos:
-                try:
-                    # Búsqueda precisa: rankear imágenes por cantidad de términos que matchean en caption
-                    neo_res = await asistente.neo4j.run(
-                        """MATCH (i:Imagen) WHERE i.path IS NOT NULL
-                        WITH i, toLower(coalesce(i.caption,'')) AS cap
-                        WITH i, cap, 
-                             size([t IN $terminos WHERE cap CONTAINS t]) AS matches
-                        WHERE matches > 0
-                        RETURN i.path AS path, coalesce(i.caption,'') AS caption, matches
-                        ORDER BY matches DESC
-                        LIMIT 1""",
-                        {"terminos": terminos_expandidos}
-                    )
-                    # Fallback: buscar en ocr_text si no hay resultado por caption
-                    if not neo_res:
-                        neo_res = await asistente.neo4j.run(
-                            """MATCH (i:Imagen) WHERE i.path IS NOT NULL
-                            WITH i, toLower(coalesce(i.ocr_text,'')) AS ocr
-                            WITH i, ocr,
-                                 size([t IN $terminos WHERE ocr CONTAINS t]) AS matches
-                            WHERE matches > 0
-                            RETURN i.path AS path, coalesce(i.caption,'') AS caption, matches
-                            ORDER BY matches DESC
-                            LIMIT 1""",
-                            {"terminos": terminos_expandidos}
-                        )
-                    for r in neo_res:
-                        p = r.get("path")
-                        if p and os.path.exists(p):
-                            with open(p, "rb") as f:
-                                data_b64 = base64.b64encode(f.read()).decode("utf-8")
-                            ext = os.path.splitext(p)[1].lower()
-                            mime = "image/png" if ext == ".png" else "image/jpeg"
-                            imagenes_b64.append({
-                                "filename": os.path.basename(p),
-                                "base64": data_b64,
-                                "mime_type": mime
-                            })
-                            print(f"   🖼️ Imagen encontrada por entidad: {os.path.basename(p)}")
-                except Exception as e:
-                    print(f"⚠️ Error buscando imágenes por entidades: {e}")
-            
-            # Fallback: buscar por regex "Imagen X.Y" en la respuesta del LLM
-            if not imagenes_b64 and respuesta:
-                refs = re.findall(r'[Ii]magen\s+(\d+[\.\s]*\d*)', respuesta)
-                archivos_vistos = set()
-                for ref_raw in refs[:1]:  # Solo la primera referencia
-                    ref_clean = ref_raw.strip().replace(" ", ".")
-                    caption_q = f"imagen {ref_clean}".lower()
-                    try:
-                        neo_res = await asistente.neo4j.run(
-                            "MATCH (i:Imagen) WHERE toLower(coalesce(i.caption,'')) CONTAINS $q "
-                            "RETURN i.path AS path LIMIT 1",
-                            {"q": caption_q}
-                        )
-                        if neo_res:
-                            p = neo_res[0].get("path")
-                            if p and os.path.exists(p) and p not in archivos_vistos:
-                                archivos_vistos.add(p)
-                                with open(p, "rb") as f:
-                                    data_b64 = base64.b64encode(f.read()).decode("utf-8")
-                                ext = os.path.splitext(p)[1].lower()
-                                mime = "image/png" if ext == ".png" else "image/jpeg"
-                                imagenes_b64.append({
-                                    "filename": os.path.basename(p),
-                                    "base64": data_b64,
-                                    "mime_type": mime
-                                })
-                                print(f"   🖼️ Imagen por referencia: Imagen {ref_clean} → {os.path.basename(p)}")
-                    except Exception as e:
-                        print(f"⚠️ Error buscando ref '{ref_raw}': {e}")
 
         # Leer trayectoria del archivo (solo para metadata de debug)
         trayectoria = []
@@ -337,11 +232,11 @@ async def post_chat(req: ChatRequest):
         return ChatResponse(
             respuesta=respuesta,
             estructura_identificada=estructura,
-            imagenes_recuperadas=[os.path.basename(p) for p in imagenes_rec_directas],
-            imagenes_base64=imagenes_b64,
+            imagenes_recuperadas=[],
+            imagenes_base64=[],
             trayectoria=trayectoria,
             imagen_activa=img_activa,
-            mostrar_imagenes=mostrar_imgs,
+            mostrar_imagenes=False,
         )
 
     except Exception as e:
