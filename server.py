@@ -211,8 +211,23 @@ async def post_chat(req: ChatRequest):
         resultado_directo = getattr(asistente, '_ultimo_resultado', {})
         estructura = resultado_directo.get("estructura_identificada")
 
-        # Imágenes deshabilitadas en el chat
-        imagenes_b64 = []
+        # Imágenes de la BD para mostrar al usuario
+        imagenes_para_mostrar = resultado_directo.get("imagenes_para_mostrar", [])
+        imagenes_response = []
+        mostrar_imgs = resultado_directo.get("mostrar_imagenes", False)
+        
+        if mostrar_imgs and imagenes_para_mostrar:
+            for img_info in imagenes_para_mostrar:
+                nombre = img_info.get("nombre_archivo", "")
+                if nombre:
+                    imagenes_response.append({
+                        "url": f"/imagenes_extraidas/{nombre}",
+                        "caption": img_info.get("caption", ""),
+                        "etiqueta": img_info.get("etiqueta", ""),
+                        "nombre_archivo": nombre,
+                        "similitud": img_info.get("similitud_semantica", 0),
+                    })
+            print(f"🖼️ {len(imagenes_response)} imágenes para mostrar al usuario")
 
         # Leer trayectoria del archivo (solo para metadata de debug)
         trayectoria = []
@@ -232,11 +247,11 @@ async def post_chat(req: ChatRequest):
         return ChatResponse(
             respuesta=respuesta,
             estructura_identificada=estructura,
-            imagenes_recuperadas=[],
+            imagenes_recuperadas=imagenes_response,
             imagenes_base64=[],
             trayectoria=trayectoria,
             imagen_activa=img_activa,
-            mostrar_imagenes=False,
+            mostrar_imagenes=mostrar_imgs and len(imagenes_response) > 0,
         )
 
     except Exception as e:

@@ -876,6 +876,128 @@ class Neo4jClient:
             print(f"⚠️ Error búsqueda imágenes por chunks: {e}")
             return []
 
+    async def busqueda_imagenes_semantica(self, texto_embedding: List[float],
+                                          entidades: Dict[str, List[str]],
+                                          embeddings_model,
+                                          top_k: int = 5) -> List[Dict]:
+        """Busca imágenes en la BD por similitud semántica con la consulta del usuario.
+        
+        Fase 1: Recuperar imágenes candidatas por texto (CONTAINS) y por chunks
+                de páginas relevantes (vector search en INDEX_TEXTO).
+        Fase 2: Re-rankear candidatas por similitud coseno entre el embedding
+                de la consulta y el embedding del caption de cada imagen
+                (generado al vuelo con sentence-transformers).
+        
+        Retorna lista de dicts con path de disco, caption, nombre_archivo, etc.
+        """
+        import unicodedata
+        print("   🔎 Búsqueda semántica de imágenes de la BD...")
+        
+        candidatas: Dict[str, Dict] = {}  # id -> imagen_dict
+        
+        # --- Fase 1a: Candidatas por texto (CONTAINS en caption/texto_pagina) ---
+        imgs_texto = await self.busqueda_imagenes_por_texto(entidades, top_k=top_k * 2)
+        for img in imgs_texto:
+            img_id = img.get("id")
+            if img_id and img_id not in candidatas:
+                candidatas[img_id] = img
+        
+        # --- Fase 1b: Buscar chunks relevantes por vector y cruzar con imágenes de esas páginas ---
+        if texto_embedding:
+            try:
+                chunks_relevantes = await self.busqueda_vectorial(texto_embedding, INDEX_TEXTO, top_k=10)
+                for chunk in chunks_relevantes:
+                    if chunk.get("similitud", 0) < 0.35:
+                        continue
+                    fuente = chunk.get("fuente", "")
+                    if not fuente:
+                        continue
+                    # Buscar imágenes del mismo PDF
+                    query_imgs_pdf = """
+                        MATCH (i:Imagen {fuente: $fuente})
+                        WHERE i.path IS NOT NULL
+                        RETURN i.id AS id,
+                               CASE 
+                                   WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                                   WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                                   ELSE coalesce(i.ocr_text, '')
+                               END AS texto,
+                               i.fuente AS fuente,
+                               'imagen' AS tipo,
+                               i.path AS imagen_path,
+                               0.40 AS similitud,
+                               coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                               coalesce(i.etiqueta, '') AS etiqueta,
+                               coalesce(i.caption, '') AS caption_raw
+                        LIMIT 20
+                    """
+                    try:
+                        imgs_pdf = await self.run(query_imgs_pdf, {"fuente": fuente})
+                        for img in imgs_pdf:
+                            img_id = img.get("id")
+                            if img_id and img_id not in candidatas:
+                                candidatas[img_id] = img
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"   ⚠️ Error buscando chunks para imágenes: {e}")
+        
+        if not candidatas:
+            print("   ℹ️ Sin imágenes candidatas encontradas")
+            return []
+        
+        print(f"   📋 {len(candidatas)} imágenes candidatas encontradas, re-ranking semántico...")
+        
+        # --- Fase 2: Re-ranking por similitud semántica del caption ---
+        resultados_rankeados = []
+        q_emb = np.array(texto_embedding)
+        
+        for img_id, img_dict in candidatas.items():
+            # Obtener el texto descriptivo de la imagen para comparar
+            caption = img_dict.get("texto", "") or img_dict.get("caption_raw", "")
+            if not caption or len(caption.strip()) < 10:
+                continue
+            
+            # Verificar que el archivo existe en disco
+            img_path = img_dict.get("imagen_path", "")
+            if not img_path or not os.path.exists(img_path):
+                continue
+            
+            try:
+                # Generar embedding del caption al vuelo
+                caption_emb = np.array(embed_query_con_reintento(embeddings_model, caption[:500]))
+                # Similitud coseno
+                sim = float(q_emb @ caption_emb / (np.linalg.norm(q_emb) * np.linalg.norm(caption_emb) + 1e-10))
+                
+                resultados_rankeados.append({
+                    "id": img_id,
+                    "path": img_path,
+                    "caption": caption[:500],
+                    "nombre_archivo": img_dict.get("nombre_archivo", os.path.basename(img_path)),
+                    "etiqueta": img_dict.get("etiqueta", ""),
+                    "fuente": img_dict.get("fuente", ""),
+                    "similitud_semantica": sim
+                })
+            except Exception as e:
+                print(f"   ⚠️ Error embedding caption para {img_id}: {e}")
+                continue
+        
+        # Ordenar por similitud descendente
+        resultados_rankeados.sort(key=lambda x: x["similitud_semantica"], reverse=True)
+        
+        # Filtrar por umbral mínimo de similitud semántica
+        umbral_caption = 0.45
+        filtrados = [r for r in resultados_rankeados if r["similitud_semantica"] >= umbral_caption]
+        
+        if filtrados:
+            print(f"   ✅ {len(filtrados)} imágenes con similitud semántica >= {umbral_caption}")
+            for r in filtrados[:top_k]:
+                print(f"      📷 {r['nombre_archivo']} | sim={r['similitud_semantica']:.3f} | {r['etiqueta']}")
+        else:
+            print(f"   ⚠️ Ninguna imagen superó el umbral de similitud semántica ({umbral_caption})")
+        
+        return filtrados[:top_k]
+
     async def busqueda_hibrida(self,
                                 texto_embedding: Optional[List[float]],
                                 imagen_embedding_uni: Optional[List[float]],
@@ -1816,6 +1938,7 @@ class AgentState(TypedDict):
     similitud_semantica_dominio: float
     confianza_baja:              bool
     mostrar_imagenes:            bool
+    imagenes_para_mostrar:       List[Dict[str, str]]  # [{path, caption, nombre_archivo, etiqueta}]
     historial_conversacional:    str
 
 
@@ -1975,11 +2098,28 @@ class AsistenteHistologiaNeo4j:
     # Detección y reescritura
     # ------------------------------------------------------------------
 
-    def _detectar_solicitud_imagen(self, consulta: str) -> bool:
-        """Detecta si la consulta solicita ver una imagen del contenido."""
-        KEYWORDS = ["imagen", "foto", "mostrame", "mostrá", "muéstrame", "ver imagen",
-                    "quiero ver", "dejame ver", "enseñame", "microfotografía"]
-        return any(kw in consulta.lower() for kw in KEYWORDS)
+    async def _detectar_solicitud_imagen(self, consulta: str) -> bool:
+        """Detecta si la consulta solicita EXPLÍCITAMENTE ver una imagen del manual/base de datos
+        usando el LLM para entender la intención del usuario."""
+        try:
+            resp_check = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=(
+                    "Tu tarea es determinar si la consulta del usuario solicita EXPLÍCITAMENTE "
+                    "ver, mostrar o buscar imágenes, fotos o microfotografías en la base de datos "
+                    "o manual.\n"
+                    "Solo debes responder 'SI' si la intención del usuario es pedir que el sistema "
+                    "le muestre una imagen (ej: 'mostrame una imagen de...', 'quiero ver fotos de...', "
+                    "'podes mostrarme imagenes').\n"
+                    "Debes responder 'NO' si la palabra 'imagen' se usa en otro contexto (ej: 'qué se "
+                    "ve en esta imagen', 'describe la imagen', 'analiza esta foto').\n"
+                    "Respondé SOLO con 'SI' o 'NO'."
+                )),
+                HumanMessage(content=f"CONSULTA: {consulta}")
+            ])
+            return resp_check.content.strip().upper().startswith("SI")
+        except Exception as e:
+            print(f"⚠️ Error en detección de intención de imagen por LLM: {e}")
+            return False
 
     async def _reescribir_consulta_con_contexto(self, consulta: str, historial: str) -> str:
         """Reescribe la consulta resolviendo referencias anafóricas usando el historial.
@@ -2117,7 +2257,7 @@ class AsistenteHistologiaNeo4j:
             state["consulta_texto"] = consulta_reescrita
         
         # Detectar si el usuario pide imágenes del contenido
-        state["mostrar_imagenes"]            = self._detectar_solicitud_imagen(consulta_original)
+        state["mostrar_imagenes"]            = await self._detectar_solicitud_imagen(consulta_original)
         if state["mostrar_imagenes"]:
             print("   🖼️ Solicitud de imagen detectada")
         
@@ -2412,8 +2552,28 @@ class AsistenteHistologiaNeo4j:
         state["resultados_busqueda"] = resultados
         print(f"✅ {len(resultados)} resultados")
 
+        # --- Búsqueda de imágenes para mostrar (cuando el usuario las pide) ---
+        if state.get("mostrar_imagenes", False):
+            print("   🖼️ Buscando imágenes de la BD para mostrar al usuario...")
+            imgs_para_mostrar = await self.neo4j.busqueda_imagenes_semantica(
+                texto_embedding=state.get("texto_embedding", []),
+                entidades=state.get("entidades_consulta", {}),
+                embeddings_model=self.embeddings,
+                top_k=3
+            )
+            state["imagenes_para_mostrar"] = imgs_para_mostrar
+            if imgs_para_mostrar:
+                print(f"   ✅ {len(imgs_para_mostrar)} imágenes encontradas para mostrar")
+                # Asegurar que hay contexto suficiente si encontramos imágenes
+                # (el usuario pidió ver imágenes y las encontramos)
+                if not state.get("contexto_suficiente"):
+                    state["contexto_suficiente"] = True
+            else:
+                print("   ⚠️ No se encontraron imágenes relevantes para mostrar")
+
         state["trayectoria"].append({
             "nodo": "BuscarNeo4j", "hits": len(resultados),
+            "imagenes_para_mostrar": len(state.get("imagenes_para_mostrar", [])),
             "tiempo": round(time.time()-t0, 2)
         })
         return state
@@ -2697,6 +2857,27 @@ class AsistenteHistologiaNeo4j:
             )
         
         instruccion_imagenes = ""
+        
+        # Si el usuario pidió ver imágenes de la BD, agregar instrucción especial
+        imagenes_para_mostrar = state.get("imagenes_para_mostrar", [])
+        if state.get("mostrar_imagenes") and imagenes_para_mostrar:
+            descripciones_imgs = []
+            for i, img_info in enumerate(imagenes_para_mostrar, 1):
+                etiqueta = img_info.get('etiqueta', '')
+                caption = img_info.get('caption', '')[:300]
+                nombre = img_info.get('nombre_archivo', '')
+                desc = f"{i}. **{etiqueta or nombre}**: {caption}"
+                descripciones_imgs.append(desc)
+            imgs_listado = "\n".join(descripciones_imgs)
+            instruccion_imagenes = (
+                "\nIMÁGENES DE REFERENCIA ENCONTRADAS EN LA BASE DE DATOS:\n"
+                "El usuario pidió ver imágenes del manual. Se encontraron las siguientes "
+                "imágenes relevantes que se mostrarán junto a tu respuesta:\n"
+                f"{imgs_listado}\n\n"
+                "INSTRUCCIÓN: Describí brevemente cada imagen encontrada usando la información "
+                "del caption del manual. Indicá qué muestra cada imagen y por qué es relevante "
+                "para la consulta del usuario. Las imágenes se mostrarán automáticamente.\n"
+            )
 
         # ── Variables del estado necesarias para el system prompt ───────
         analisis_comp_str   = _safe(state.get("analisis_comparativo"))
@@ -2875,6 +3056,7 @@ class AsistenteHistologiaNeo4j:
                 "imagenes_recuperadas":    state.get("imagenes_recuperadas", []),
                 "entidades_consulta":      state.get("entidades_consulta", {}),
                 "mostrar_imagenes":        state.get("mostrar_imagenes", False),
+                "imagenes_para_mostrar":   state.get("imagenes_para_mostrar", []),
             }, f, indent=4, ensure_ascii=False)
 
         print(f"✅ Flujo v4.1 completado en {total}s")
@@ -3057,7 +3239,8 @@ class AsistenteHistologiaNeo4j:
             imagenes_texto_map={},
             analisis_comparativo=None, estructura_identificada=None,
             similitud_semantica_dominio=0.0, confianza_baja=False,
-            mostrar_imagenes=False, historial_conversacional="",
+            mostrar_imagenes=False, imagenes_para_mostrar=[],
+            historial_conversacional="",
         )
 
         config = {
@@ -3089,6 +3272,7 @@ class AsistenteHistologiaNeo4j:
             "mostrar_imagenes": final.get("mostrar_imagenes", False),
             "imagenes_recuperadas": final.get("imagenes_recuperadas", []),
             "estructura_identificada": final.get("estructura_identificada"),
+            "imagenes_para_mostrar": final.get("imagenes_para_mostrar", []),
         }
         
         return respuesta
