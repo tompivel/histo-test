@@ -14,8 +14,8 @@ dependencies = [
     # LangSmith observability
     "langsmith>=0.1",
     # ML / Torch
-    "torch==2.6.0",
-    "torchvision==0.21.0",
+    "torch==2.5.1",
+    "torchvision==0.20.1",
     "numpy>=1.24",
     "Pillow>=10.0",
     # Async
@@ -44,13 +44,4 @@ packages = []
 requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
-[[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
 
-[tool.uv.sources]
-torch = { index = "pytorch-cu124" }
-torchvision = { index = "pytorch-cu124" }
-torchaudio = { index = "pytorch-cu124" }
-torchcodec = { index = "pytorch-cu124" }
