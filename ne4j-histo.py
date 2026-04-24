@@ -37,13 +37,36 @@ from dotenv import load_dotenv
 # Cargar variables de entorno desde .env
 load_dotenv()
 
+# Wrapper interactivo para Colab / .env
+try:
+    from google.colab import userdata as colab_userdata
+    _IN_COLAB = True
+except ImportError:
+    _IN_COLAB = False
+
+class userdata:
+    @staticmethod
+    def get(key):
+        val = os.environ.get(key)
+        if val is not None:
+            return val
+        if _IN_COLAB:
+            try:
+                val = colab_userdata.get(key)
+                if val:
+                    os.environ[key] = val
+                    return val
+            except Exception:
+                pass
+        return None
+
 # UNI & PLIP
 import timm
 from transformers import CLIPProcessor, CLIPModel
 from huggingface_hub import login
 
 # Verificar HF_TOKEN
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = userdata.get("HF_TOKEN")
 if HF_TOKEN:
     try:
         login(token=HF_TOKEN)
@@ -51,7 +74,7 @@ if HF_TOKEN:
     except Exception as e:
         print(f"⚠️ Error login HF: {e}")
 else:
-    print("⚠️ HF_TOKEN no encontrado en .env (necesario para UNI)")
+    print("⚠️ HF_TOKEN no encontrado en .env/Colab (necesario para UNI)")
 
 # Neo4j
 from neo4j import AsyncGraphDatabase, AsyncDriver
@@ -73,11 +96,6 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 import uuid
 
-# Wrapper para leer variables de entorno (compatible con .env)
-class userdata:
-    @staticmethod
-    def get(key):
-        return os.environ.get(key)
 
 nest_asyncio.apply()
 
