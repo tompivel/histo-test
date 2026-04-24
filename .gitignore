@@ -14,3 +14,6 @@ logs/
 # Generated files
 trayectoria_neo4j.json
 temario_histologia.json
+
+#editors
+.vscode/
