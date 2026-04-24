@@ -413,6 +413,7 @@ class Neo4jClient:
             "CREATE CONSTRAINT tejido_nombre IF NOT EXISTS FOR (t:Tejido) REQUIRE t.nombre IS UNIQUE",
             "CREATE CONSTRAINT estructura_nombre IF NOT EXISTS FOR (e:Estructura) REQUIRE e.nombre IS UNIQUE",
             "CREATE CONSTRAINT tincion_nombre IF NOT EXISTS FOR (t:Tincion) REQUIRE t.nombre IS UNIQUE",
+            "CREATE CONSTRAINT tabla_id IF NOT EXISTS FOR (t:Tabla) REQUIRE t.id IS UNIQUE",
         ]
         for c in constraints:
             try:
@@ -483,7 +484,7 @@ class Neo4jClient:
 
     async def upsert_chunk(self, chunk_id: str, texto: str, fuente: str,
                             chunk_idx: int, embedding: List[float],
-                            entidades: Dict[str, List[str]]):
+                            entidades: Dict[str, List]):
         await self.run("""
             MERGE (c:Chunk {id: $id})
             SET c.texto = $texto, c.fuente = $fuente,
@@ -495,44 +496,62 @@ class Neo4jClient:
             "id": chunk_id, "texto": texto, "fuente": fuente,
             "chunk_idx": chunk_idx, "embedding": embedding
         })
+        # ── Tejidos con normalización SNOMED/FMA ──
         for tejido in entidades.get("tejidos", []):
+            t_nombre = tejido.get("nombre", tejido) if isinstance(tejido, dict) else tejido
+            snomed_id = tejido.get("snomed_id") if isinstance(tejido, dict) else None
+            fma_id = tejido.get("fma_id") if isinstance(tejido, dict) else None
             await self.run("""
                 MERGE (t:Tejido {nombre: $nombre})
+                SET t.snomed_id = coalesce($snomed_id, t.snomed_id),
+                    t.fma_id = coalesce($fma_id, t.fma_id)
                 WITH t MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(t)
-            """, {"nombre": tejido, "chunk_id": chunk_id})
+            """, {"nombre": t_nombre, "chunk_id": chunk_id,
+                  "snomed_id": snomed_id, "fma_id": fma_id})
+        # ── Estructuras con normalización SNOMED ──
         for estructura in entidades.get("estructuras", []):
+            e_nombre = estructura.get("nombre", estructura) if isinstance(estructura, dict) else estructura
+            snomed_id = estructura.get("snomed_id") if isinstance(estructura, dict) else None
             await self.run("""
                 MERGE (e:Estructura {nombre: $nombre})
+                SET e.snomed_id = coalesce($snomed_id, e.snomed_id)
                 WITH e MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(e)
-            """, {"nombre": estructura, "chunk_id": chunk_id})
+            """, {"nombre": e_nombre, "chunk_id": chunk_id,
+                  "snomed_id": snomed_id})
         for tincion in entidades.get("tinciones", []):
             await self.run("""
                 MERGE (t:Tincion {nombre: $nombre})
-                WITH t MATCH (c:Chunk {id: $chunk_id})
+                With t MATCH (c:Chunk {id: $chunk_id})
                 MERGE (c)-[:MENCIONA]->(t)
             """, {"nombre": tincion, "chunk_id": chunk_id})
-        for tejido in entidades.get("tejidos", []):
-            for estructura in entidades.get("estructuras", []):
+        # ── Relaciones cruzadas (normalizando dicts a strings) ──
+        tejidos_lista = [t.get("nombre", t) if isinstance(t, dict) else t
+                         for t in entidades.get("tejidos", [])]
+        estructuras_lista = [e.get("nombre", e) if isinstance(e, dict) else e
+                             for e in entidades.get("estructuras", [])]
+        tinciones_lista = entidades.get("tinciones", [])
+        for t in tejidos_lista:
+            for e in estructuras_lista:
                 await self.run("""
-                    MERGE (t:Tejido {nombre: $tejido})
-                    MERGE (e:Estructura {nombre: $estructura})
-                    MERGE (t)-[:CONTIENE]->(e)
-                """, {"tejido": tejido, "estructura": estructura})
-            for tincion in entidades.get("tinciones", []):
+                    MERGE (tej:Tejido {nombre: $tejido})
+                    MERGE (est:Estructura {nombre: $estructura})
+                    MERGE (tej)-[:CONTIENE]->(est)
+                """, {"tejido": t, "estructura": e})
+            for ti in tinciones_lista:
                 await self.run("""
-                    MERGE (t:Tejido {nombre: $tejido})
-                    MERGE (ti:Tincion {nombre: $tincion})
-                    MERGE (t)-[:TENIDA_CON]->(ti)
-                """, {"tejido": tejido, "tincion": tincion})
-        for estructura in entidades.get("estructuras", []):
-            for tincion in entidades.get("tinciones", []):
+                    MERGE (tej:Tejido {nombre: $tejido})
+                    MERGE (tinc:Tincion {nombre: $tincion})
+                    MERGE (tej)-[:TENIDA_CON]->(tinc)
+                """, {"tejido": t, "tincion": ti})
+        for e in estructuras_lista:
+            for ti in tinciones_lista:
                 await self.run("""
-                    MERGE (e:Estructura {nombre: $estructura})
-                    MERGE (ti:Tincion {nombre: $tincion})
-                    MERGE (e)-[:TENIDA_CON]->(ti)
-                """, {"estructura": estructura, "tincion": tincion})
+                    MERGE (est:Estructura {nombre: $estructura})
+                    MERGE (tinc:Tincion {nombre: $tincion})
+                    MERGE (est)-[:TENIDA_CON]->(tinc)
+                """, {"estructura": e, "tincion": ti})
 
     async def upsert_imagen(self, imagen_id: str, path: str, fuente: str,
                              pagina: int, ocr_text: str, texto_pagina: str,
@@ -560,6 +579,23 @@ class Neo4jClient:
             "caption": caption, "nombre_archivo": nombre_archivo,
             "etiqueta": etiqueta,
             "emb_uni": emb_uni, "emb_plip": emb_plip
+        })
+
+    async def upsert_tabla(self, tabla_id: str, contenido_md: str, fuente: str,
+                           pagina: int, embedding: Optional[List[float]] = None):
+        """Inserta o actualiza un nodo :Tabla con su contenido Markdown."""
+        await self.run("""
+            MERGE (t:Tabla {id: $id})
+            SET t.contenido_md = $contenido_md, t.fuente = $fuente,
+                t.pagina = $pagina, t.embedding = $embedding
+            WITH t
+            MERGE (pdf:PDF {nombre: $fuente})
+            MERGE (t)-[:PERTENECE_A]->(pdf)
+            MERGE (pag:Pagina {numero: $pagina, pdf_nombre: $fuente})
+            MERGE (t)-[:EN_PAGINA]->(pag)
+        """, {
+            "id": tabla_id, "contenido_md": contenido_md, "fuente": fuente,
+            "pagina": pagina, "embedding": embedding
         })
 
     async def crear_relaciones_similitud(self, umbral: float = SIMILAR_IMG_THRESHOLD):
@@ -1061,6 +1097,18 @@ class Neo4jClient:
                 except Exception:
                     pass
 
+        # ── Near-duplicate detection (UNI ∩ PLIP con score ≥ 0.95) ──
+        near_dup_ids = set()
+        if res_uni and res_plip:
+            uni_scores = {r["id"]: r["similitud"] for r in res_uni if r.get("id")}
+            plip_scores = {r["id"]: r["similitud"] for r in res_plip if r.get("id")}
+            for img_id in uni_scores:
+                if img_id in plip_scores:
+                    if uni_scores[img_id] >= 0.95 and plip_scores[img_id] >= 0.95:
+                        near_dup_ids.add(img_id)
+            if near_dup_ids:
+                print(f"   🎯 Near-duplicates detectados: {near_dup_ids}")
+
         combined: Dict[str, Dict] = {}
 
         def agregar(resultados: List[Dict], peso: float, es_visual: bool = False):
@@ -1076,6 +1124,10 @@ class Neo4jClient:
                 # Evita que entidades alucinadas le ganen a la imagen correcta
                 if es_visual and sim > 0.95:
                     sim_ponderada += 2.0
+                
+                # Near-duplicate boost ×2.0 (UNI ∩ PLIP ambos ≥ 0.95)
+                if r.get("id") in near_dup_ids:
+                    sim_ponderada *= 2.0
                     
                 if key not in combined:
                     combined[key] = {**r, "similitud": sim_ponderada}
@@ -1100,7 +1152,8 @@ class Neo4jClient:
 
         print(f"   📊 Híbrida: Txt={len(res_texto)} | "
               f"UNI={len(res_uni)} | PLIP={len(res_plip)} | Ent={len(res_ent)} | "
-              f"Vec={len(res_vec)} | PagCtx={len(res_pag_chunks)} -> {len(final)}")
+              f"Vec={len(res_vec)} | PagCtx={len(res_pag_chunks)} -> {len(final)}"
+              + (f" | 🎯 NearDup={len(near_dup_ids)}" if near_dup_ids else ""))
 
         return final[:15]
 
@@ -1810,6 +1863,55 @@ class ExtractorImagenesPDF:
         print(f"✅ Total imágenes: {len(todas)}")
         return todas
 
+    async def _detectar_y_extraer_tabla(self, imagen_path: str) -> str:
+        """Usa un LLM multimodal para detectar y formatear tablas en la página.
+        Intenta Groq Vision primero, con fallback a Gemini."""
+        if not self.llm:
+            return ""
+        try:
+            with open(imagen_path, "rb") as f:
+                img_data = base64.b64encode(f.read()).decode("utf-8")
+
+            msg = HumanMessage(content=[
+                {"type": "text", "text": (
+                    "Analiza esta imagen de una página de un manual de histología.\n"
+                    "Si encuentras tablas con datos técnicos, extráelas en formato Markdown.\n"
+                    "Si no hay tablas, responde únicamente con 'SIN_TABLAS'."
+                )},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_data}"}}
+            ])
+
+            # Intento 1: Groq Vision
+            try:
+                llm_vision = ChatGroq(
+                    model="llama-3.2-11b-vision-preview",
+                    api_key=userdata.get("GROQ_API_KEY"),
+                    temperature=0, max_retries=1
+                )
+                resp = await invoke_con_reintento(llm_vision, [msg])
+                texto = resp.content.strip()
+                return "" if "SIN_TABLAS" in texto else texto
+            except Exception as e_groq:
+                print(f"  ⚠️ Groq vision no disponible: {e_groq}")
+
+            # Intento 2: Fallback a Gemini
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                llm_gemini = ChatGoogleGenerativeAI(
+                    model="gemini-2.5-flash",
+                    google_api_key=userdata.get("GOOGLE_API_KEY"),
+                    temperature=0,
+                )
+                resp = await invoke_con_reintento(llm_gemini, [msg])
+                texto = resp.content.strip()
+                return "" if "SIN_TABLAS" in texto else texto
+            except Exception as e_gemini:
+                print(f"  ⚠️ Gemini fallback también falló: {e_gemini}")
+                return ""
+        except Exception as e:
+            print(f"  ⚠️ Error detectando tabla: {e}")
+            return ""
+
 
 # =============================================================================
 # EXTRACTOR DE TEMARIO
@@ -1855,22 +1957,25 @@ class ExtractorEntidades:
     def __init__(self, llm):
         self.llm = llm
 
-    async def extraer_de_texto(self, texto: str) -> Dict[str, List[str]]:
+    async def extraer_de_texto(self, texto: str) -> Dict[str, List]:
         system = (
-            "Extrae entidades histológicas del texto. "
-            'Responde SOLO en JSON: {"tejidos": [...], "estructuras": [...], "tinciones": [...]}\n'
-            "Máximo 3 items por categoría. Si no hay, lista vacía."
+            "Extrae entidades histológicas y normalízalas a ontologías (SNOMED CT / FMA).\n"
+            "Para cada TEJIDO, busca su nombre técnico, ID SNOMED y ID FMA.\n"
+            "Para cada ESTRUCTURA, busca su nombre técnico e ID SNOMED.\n"
+            'Responde SOLO en JSON: {"tejidos": [{"nombre": "...", "snomed_id": "...", "fma_id": "..."}, ...], '
+            '"estructuras": [{"nombre": "...", "snomed_id": "..."}, ...], "tinciones": [...]}\n'
+            "Máximo 3 items por categoría. Si no sabés el ID, poné null."
         )
         try:
             resp = await invoke_con_reintento(self.llm, [
                 SystemMessage(content=system),
-                HumanMessage(content=texto[:500])
+                HumanMessage(content=texto[:1000])
             ])
             texto_resp = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
             resultado  = json.loads(texto_resp)
             return {
-                "tejidos":     [t.lower() for t in resultado.get("tejidos", [])[:3]],
-                "estructuras": [e.lower() for e in resultado.get("estructuras", [])[:3]],
+                "tejidos":     resultado.get("tejidos", [])[:3],
+                "estructuras": resultado.get("estructuras", [])[:3],
                 "tinciones":   [t.lower() for t in resultado.get("tinciones", [])[:3]],
             }
         except Exception:
@@ -1940,6 +2045,7 @@ class AgentState(TypedDict):
     mostrar_imagenes:            bool
     imagenes_para_mostrar:       List[Dict[str, str]]  # [{path, caption, nombre_archivo, etiqueta}]
     historial_conversacional:    str
+    metricas_rag:                Optional[Dict[str, float]]
 
 
 # =============================================================================
@@ -2000,6 +2106,7 @@ class AsistenteHistologiaNeo4j:
         )
         self.extractor_temario   = ExtractorTemario(llm=self.llm)
         self.extractor_entidades = ExtractorEntidades(llm=self.llm)
+        self.extractor_imagenes.llm = self.llm  # Inyectar LLM para detección de tablas
         self.clasificador_semantico = ClasificadorSemantico(
             llm=self.llm,
             embeddings=self.embeddings, # Gemini
@@ -2060,6 +2167,7 @@ class AsistenteHistologiaNeo4j:
         g.add_node("filtrar_contexto",     self._nodo_filtrar_contexto)
         g.add_node("analisis_comparativo", self._nodo_analisis_comparativo)
         g.add_node("generar_respuesta",    self._nodo_generar_respuesta)
+        g.add_node("evaluar_rag",          self._nodo_evaluar_rag)
         g.add_node("finalizar",            self._nodo_finalizar)
         g.add_node("fuera_temario",        self._nodo_fuera_temario)
 
@@ -2089,7 +2197,8 @@ class AsistenteHistologiaNeo4j:
             {"con_imagen": "analisis_comparativo", "sin_imagen": "generar_respuesta"}
         )
         g.add_edge("analisis_comparativo", "generar_respuesta")
-        g.add_edge("generar_respuesta",    "finalizar")
+        g.add_edge("generar_respuesta",    "evaluar_rag")
+        g.add_edge("evaluar_rag",          "finalizar")
         g.add_edge("finalizar",            END)
 
         self.graph = g
@@ -3041,6 +3150,86 @@ class AsistenteHistologiaNeo4j:
         })
         return state
 
+    async def _nodo_evaluar_rag(self, state: AgentState) -> AgentState:
+        """LLM-as-a-Judge: evalúa fidelidad, relevancia_contexto y relevancia_respuesta.
+        Solo se ejecuta en consultas de texto puro (sin imagen)."""
+        t0 = time.time()
+
+        # Solo evaluar en modo texto con contexto suficiente
+        if state.get("tiene_imagen") or not state.get("contexto_suficiente"):
+            print("ℹ️  Evaluación RAG omitida (modo imagen o sin contexto)")
+            state["metricas_rag"] = None
+            state["trayectoria"].append({
+                "nodo": "EvaluarRAG", "omitido": True,
+                "tiempo": round(time.time() - t0, 2)
+            })
+            return state
+
+        print("📏 Evaluando calidad RAG (LLM-as-a-Judge)...")
+
+        contexto = state.get("contexto_documentos", "")[:2000]
+        consulta = state.get("consulta_texto", "")
+        respuesta = state.get("respuesta_final", "")
+
+        system_eval = (
+            "Sos un evaluador experto de sistemas RAG (Retrieval-Augmented Generation).\n"
+            "Tu tarea es evaluar la calidad de una respuesta generada por un asistente de histología.\n\n"
+            "Evaluá las siguientes 3 métricas del 1 al 10:\n\n"
+            "1. **fidelidad**: ¿La respuesta se basa SOLO en el contexto recuperado? "
+            "(10 = no inventa nada, 1 = alucina completamente)\n"
+            "2. **relevancia_contexto**: ¿El contexto recuperado era útil para responder la pregunta? "
+            "(10 = perfecto, 1 = totalmente irrelevante)\n"
+            "3. **relevancia_respuesta**: ¿La respuesta contesta directamente lo que se preguntó? "
+            "(10 = responde exactamente, 1 = no tiene nada que ver)\n\n"
+            "Respondé SOLO con JSON estricto, sin explicaciones:\n"
+            '{"fidelidad": N, "relevancia_contexto": N, "relevancia_respuesta": N}'
+        )
+
+        user_eval = (
+            f"PREGUNTA DEL USUARIO:\n{consulta}\n\n"
+            f"CONTEXTO RECUPERADO (fragmentos del manual):\n{contexto}\n\n"
+            f"RESPUESTA DEL ASISTENTE:\n{respuesta[:2000]}"
+        )
+
+        try:
+            resp = await invoke_con_reintento(self.llm, [
+                SystemMessage(content=system_eval),
+                HumanMessage(content=user_eval)
+            ])
+            texto_resp = re.sub(r"```json\s*|\s*```", "", resp.content.strip())
+            metricas = json.loads(texto_resp)
+
+            # Validar y clampear valores
+            for key in ["fidelidad", "relevancia_contexto", "relevancia_respuesta"]:
+                val = metricas.get(key, 0)
+                metricas[key] = max(1, min(10, int(val)))
+
+            state["metricas_rag"] = metricas
+
+            # Pretty print
+            fid = metricas["fidelidad"]
+            rc  = metricas["relevancia_contexto"]
+            rr  = metricas["relevancia_respuesta"]
+            avg = round((fid + rc + rr) / 3, 1)
+            print(f"\n{'─'*50}")
+            print(f"📊 MÉTRICAS RAG (LLM-as-a-Judge)")
+            print(f"   🎯 Fidelidad:            {fid}/10")
+            print(f"   📚 Relevancia contexto:   {rc}/10")
+            print(f"   ✅ Relevancia respuesta:  {rr}/10")
+            print(f"   📈 Promedio:              {avg}/10")
+            print(f"{'─'*50}")
+
+        except Exception as e:
+            print(f"⚠️ Error evaluando RAG: {e}")
+            state["metricas_rag"] = None
+
+        state["trayectoria"].append({
+            "nodo": "EvaluarRAG",
+            "metricas": state.get("metricas_rag"),
+            "tiempo": round(time.time() - t0, 2)
+        })
+        return state
+
     async def _nodo_finalizar(self, state: AgentState) -> AgentState:
         # Guardar siempre en memoria, no solo cuando hay contexto suficiente
         if state.get("respuesta_final"):
@@ -3057,6 +3246,7 @@ class AsistenteHistologiaNeo4j:
                 "entidades_consulta":      state.get("entidades_consulta", {}),
                 "mostrar_imagenes":        state.get("mostrar_imagenes", False),
                 "imagenes_para_mostrar":   state.get("imagenes_para_mostrar", []),
+                "metricas_rag":            state.get("metricas_rag"),
             }, f, indent=4, ensure_ascii=False)
 
         print(f"✅ Flujo v4.1 completado en {total}s")
@@ -3087,8 +3277,44 @@ class AsistenteHistologiaNeo4j:
             print(f"⚠️ Error leyendo {path}: {e}")
             return ""
 
-    def _chunks(self, texto: str, size: int = 500) -> List[str]:
-        return [texto[i:i+size] for i in range(0, len(texto), size)]
+    def _chunks(self, text: str, chunk_size: int = 800, chunk_overlap: int = 150) -> List[str]:
+        """RecursiveCharacterTextSplitter: separadores jerárquicos con overlap."""
+        separators = ["\n\n", "\n", ". ", " ", ""]
+
+        def _split_recursive(t, seps):
+            if len(t) <= chunk_size:
+                return [t]
+            sep = seps[0]
+            if len(seps) > 1:
+                splits = t.split(sep)
+            else:
+                return [t[i:i+chunk_size] for i in range(0, len(t), chunk_size - chunk_overlap)]
+            current_chunk = ""
+            results = []
+            for s in splits:
+                if len(current_chunk) + len(s) + len(sep) <= chunk_size:
+                    current_chunk += (sep if current_chunk else "") + s
+                else:
+                    if current_chunk:
+                        results.append(current_chunk)
+                    if len(s) > chunk_size:
+                        results.extend(_split_recursive(s, seps[1:]))
+                        current_chunk = ""
+                    else:
+                        current_chunk = s
+            if current_chunk:
+                results.append(current_chunk)
+            # Overlap
+            overlapped = []
+            for i, res in enumerate(results):
+                if i > 0:
+                    overlap_txt = results[i-1][-chunk_overlap:]
+                    overlapped.append(overlap_txt + res)
+                else:
+                    overlapped.append(res)
+            return overlapped
+
+        return _split_recursive(text, separators)
 
     def procesar_contenido_base(self, directorio: str = DIRECTORIO_PDFS) -> str:
         pdfs = glob.glob(os.path.join(directorio, "*.pdf"))
@@ -3177,6 +3403,23 @@ class AsistenteHistologiaNeo4j:
                     nombre_archivo=nombre_archivo,
                     etiqueta=etiqueta
                 )
+
+                # ── Detección y extracción de tablas multimodales ──
+                try:
+                    tabla_md = await self.extractor_imagenes._detectar_y_extraer_tabla(img_path)
+                    if tabla_md:
+                        tabla_id = f"tabla_{img_info['fuente_pdf']}_{img_info['pagina']}"
+                        await self.neo4j.upsert_tabla(
+                            tabla_id=tabla_id,
+                            contenido_md=tabla_md,
+                            fuente=img_info["fuente_pdf"],
+                            pagina=img_info["pagina"],
+                            embedding=emb_u.tolist()
+                        )
+                        print(f"  📊 Tabla detectada en {os.path.basename(img_path)}")
+                except Exception as e_tabla:
+                    print(f"  ⚠️ Error tabla {os.path.basename(img_path)}: {e_tabla}")
+
             except Exception as e:
                 print(f"  ⚠️ Imagen {img_path}: {e}")
 
@@ -3241,6 +3484,7 @@ class AsistenteHistologiaNeo4j:
             similitud_semantica_dominio=0.0, confianza_baja=False,
             mostrar_imagenes=False, imagenes_para_mostrar=[],
             historial_conversacional="",
+            metricas_rag=None,
         )
 
         config = {
