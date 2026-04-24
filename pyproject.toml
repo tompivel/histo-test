@@ -9,7 +9,6 @@ dependencies = [
     "pdf2image>=1.16",
     "pytesseract>=0.3",
     # LangChain / LangGraph
-    "langchain-google-genai>=2.0",
     "langchain-core>=0.3",
     "langgraph>=0.2",
     # LangSmith observability
@@ -23,8 +22,6 @@ dependencies = [
     "nest-asyncio>=1.5",
     # Environment
     "python-dotenv>=1.0",
-    # CONCH (Mahmood Lab)
-    "conch @ git+https://github.com/mahmoodlab/CONCH.git",
     # UNI / UNI2-h (Mahmood Lab) via timm
     "timm>=0.9.12",
     "huggingface-hub",
