@@ -179,12 +179,17 @@ class Neo4jClient:
 
     async def upsert_image(self, image_id: str, path: str, source: str,
                              page: int, ocr_text: str, page_text: str,
-                             emb_uni: List[float], emb_plip: List[float]):
+                             emb_uni: List[float], emb_plip: List[float],
+                             caption: str = "", nombre_archivo: str = "",
+                             etiqueta: str = ""):
         await self.run("""
             MERGE (i:Imagen {id: $id})
             SET i.path = $path, i.fuente = $source,
                 i.pagina = $page, i.ocr_text = $ocr_text,
                 i.texto_pagina = $page_text,
+                i.caption = $caption,
+                i.nombre_archivo = $nombre_archivo,
+                i.etiqueta = $etiqueta,
                 i.embedding_uni = $emb_uni,
                 i.embedding_plip = $emb_plip
             WITH i
@@ -195,6 +200,8 @@ class Neo4jClient:
         """, {
             "id": image_id, "path": path, "source": source,
             "page": page, "ocr_text": ocr_text, "page_text": page_text,
+            "caption": caption, "nombre_archivo": nombre_archivo,
+            "etiqueta": etiqueta,
             "emb_uni": emb_uni, "emb_plip": emb_plip
         })
 

@@ -150,7 +150,10 @@ class IngestionPipeline:
                     ocr_text=img_info.get("ocr_text", ""),
                     page_text=img_info.get("page_text", ""),
                     emb_uni=emb_u.tolist(),
-                    emb_plip=emb_p.tolist()
+                    emb_plip=emb_p.tolist(),
+                    caption=img_info.get("caption", ""),
+                    nombre_archivo=img_info.get("nombre_archivo", ""),
+                    etiqueta=img_info.get("etiqueta", "")
                 )
 
                 # ── Table detection via multimodal LLM (Groq Vision → Gemini fallback) ──

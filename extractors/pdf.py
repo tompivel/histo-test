@@ -1,3 +1,4 @@
+import re
 import os
 import base64
 import fitz # PyMuPDF
@@ -31,6 +32,53 @@ class PDFImageExtractor:
         self.llm = llm
         os.makedirs(output_dir, exist_ok=True)
 
+    @staticmethod
+    def _extraer_etiqueta_imagen(texto: str) -> str:
+        """Busca patrones como 'Imagen X.X' o 'Fig X.X'."""
+        patrones = [
+            r"(Imagen\s*\d+[\.\-]\d+)",
+            r"(Fig[uura]*\s*\d+[\.\-]\d+)",
+            r"(I\s*\d+[\.\-]\d+)",
+            r"(Lámina\s*\d+[\.\-]\d+)"
+        ]
+        for patron in patrones:
+            match = re.search(patron, texto, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def extraer_caption_imagen(page_fitz, img_bbox, texto_pagina_completo: str) -> str:
+        caption = ""
+        try:
+            page_rect = page_fitz.rect
+            margen_overlap = 10
+            area_expandida = fitz.Rect(
+                0,
+                max(0, img_bbox[3] - margen_overlap),
+                page_rect.width,
+                page_rect.height
+            )
+            texto_expandido = page_fitz.get_text("text", clip=area_expandida).strip()
+            
+            if texto_expandido:
+                caption = texto_expandido
+            else:
+                area_abajo = fitz.Rect(
+                    0,
+                    img_bbox[3],
+                    page_rect.width,
+                    page_rect.height
+                )
+                caption = page_fitz.get_text("text", clip=area_abajo).strip()
+        except Exception:
+            pass
+        
+        if caption:
+            caption = re.sub(r'\n\s*\d{1,3}\s*$', '', caption).strip()
+            return caption
+        return texto_pagina_completo[:500] if texto_pagina_completo else ""
+
     def extract_from_pdf(self, pdf_path: str) -> List[Dict[str, str]]:
         extracted_images = []
         pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -61,7 +109,8 @@ class PDFImageExtractor:
             
             try:
                 img_info_list = page.get_image_info(xrefs=True)
-                page_xrefs = [info["xref"] for info in img_info_list if info.get("xref")]
+                xref_to_bbox = {info["xref"]: info.get("bbox") for info in img_info_list if info.get("xref")}
+                page_xrefs = list(xref_to_bbox.keys())
                 
                 if page_xrefs:
                     for xref in page_xrefs:
@@ -77,7 +126,8 @@ class PDFImageExtractor:
                             if w >= self.MIN_WIDTH and h >= self.MIN_HEIGHT:
                                 valid_images_this_page.append({
                                     "pil": pil_temp,
-                                    "area": w * h
+                                    "area": w * h,
+                                    "bbox": xref_to_bbox.get(xref)
                                 })
                         except Exception:
                             continue
@@ -87,6 +137,7 @@ class PDFImageExtractor:
             if valid_images_this_page:
                 best_img = max(valid_images_this_page, key=lambda x: x["area"])
                 pil_img = best_img["pil"]
+                img_bbox = best_img["bbox"]
                 file_name = f"{pdf_name}_pag{page_num}.png"
                 full_path  = os.path.join(self.output_dir, file_name)
                 
@@ -98,11 +149,17 @@ class PDFImageExtractor:
                         ocr_text = ""
                     
                     full_page_text = _page_text_with_context(doc, idx_0)
+                    
+                    caption = ""
+                    if img_bbox:
+                        caption = self.extraer_caption_imagen(page, img_bbox, full_page_text)
+                    etiqueta = self._extraer_etiqueta_imagen(caption)
 
                     extracted_images.append({
                         "path": full_path, "source_pdf": os.path.basename(pdf_path),
                         "page": page_num, "index": 1, "ocr_text": ocr_text,
-                        "page_text": full_page_text
+                        "page_text": full_page_text,
+                        "caption": caption, "etiqueta": etiqueta, "nombre_archivo": file_name
                     })
                 except Exception as e:
                     print(f"  ⚠️ Error saving page {page_num}: {e}")
@@ -123,10 +180,14 @@ class PDFImageExtractor:
 
                         full_page_text = _page_text_with_context(doc, idx_0)
                         
+                        caption_fb = full_page_text[:500] if full_page_text else ""
+                        etiqueta_fb = self._extraer_etiqueta_imagen(caption_fb)
+
                         extracted_images.append({
                             "path": full_path, "source_pdf": os.path.basename(pdf_path),
                             "page": page_num, "index": 1, "ocr_text": ocr_text,
-                            "page_text": full_page_text
+                            "page_text": full_page_text,
+                            "caption": caption_fb, "etiqueta": etiqueta_fb, "nombre_archivo": file_name
                         })
                 except Exception as e:
                     print(f"  ⚠️ Fallback error page {page_num}: {e}")
