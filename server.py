@@ -53,8 +53,10 @@ class ChatResponse(BaseModel):
     respuesta: str
     estructura_identificada: Optional[str] = None
     imagenes_recuperadas: list = []
+    imagenes_base64: list = []  # Lista de {filename, base64, mime_type}
     trayectoria: list = []
     imagen_activa: Optional[str] = None
+    mostrar_imagenes: bool = False
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────
@@ -104,6 +106,7 @@ app.add_middleware(
 )
 
 CLIENT_DIR = Path(__file__).parent / "client"
+IMAGENES_DIR = Path(__file__).parent / "imagenes_extraidas"
 
 def _check_ready():
     if not _init_complete:
@@ -188,8 +191,10 @@ async def post_chat(req: ChatRequest):
             respuesta=agent_result.get("answer", ""),
             estructura_identificada=agent_result.get("identified_structure"),
             imagenes_recuperadas=agent_result.get("recovered_images", []),
+            imagenes_base64=[],
             trayectoria=agent_result.get("trajectory", []),
             imagen_activa=active_image_state_name,
+            mostrar_imagenes=agent_result.get("mostrar_imagenes", False) and len(agent_result.get("recovered_images", [])) > 0,
         )
 
     except Exception as e:
@@ -207,6 +212,10 @@ async def limpiar_imagen():
     active_image_state_name = None
     return {"ok": True, "mensaje": "Active image decoupled"}
 
+
+# ── Ruta estática: imágenes extraídas ────────────────────────────────
+if IMAGENES_DIR.exists():
+    app.mount("/imagenes_extraidas", StaticFiles(directory=str(IMAGENES_DIR)), name="imagenes_extraidas")
 
 def main():
     port = int(os.getenv("PORT", "10005"))

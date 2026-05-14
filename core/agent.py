@@ -39,7 +39,8 @@ class AgentState(TypedDict):
     output: str
     trajectory: List[Dict]
     identified_structure: Optional[str]
-    recovered_images: List[str]
+    recovered_images: List[Dict]
+    solicita_imagenes: bool
 
 class Neo4jHistologyAgent:
     """
@@ -233,12 +234,44 @@ class Neo4jHistologyAgent:
             
         results = await self.db.hybrid_search(emb_query, emb_uni_usr, emb_plip_usr, entidades, top_k=8)
         
+        if not state.get("user_image") and state.get("solicita_imagenes"):
+            # Text-only mode: perform semantic image re-ranking to find relevant images
+            semantic_imgs = await self.db.busqueda_imagenes_semantica(emb_query, entidades, self.embeddings, top_k=3)
+            # Merge and deduplicate
+            existing_ids = {r.get("id") for r in results if r.get("id")}
+            for img in semantic_imgs:
+                if img.get("id") not in existing_ids:
+                    results.append(img)
+                    
         recover_imgs = []
+        valid_results = []
         for r in results:
-            if r.get("type") == "imagen" and r.get("image_path"):
-                recover_imgs.append(os.path.basename(r.get("image_path")))
+            if r.get("type") == "imagen":
+                img_path = r.get("image_path")
+                if img_path and os.path.exists(img_path):
+                    nombre = os.path.basename(img_path)
+                    recover_imgs.append({
+                        "url": f"/imagenes_extraidas/{nombre}",
+                        "caption": r.get("text", "") or r.get("caption", ""),
+                        "etiqueta": r.get("etiqueta", ""),
+                        "nombre_archivo": nombre,
+                        "similitud": r.get("similarity", 0),
+                    })
+                    valid_results.append(r)
+                else:
+                    print(f"   ⚠️ Skipping invalid image path: {img_path}")
+            else:
+                valid_results.append(r)
                 
-        return {"db_context": results, "recovered_images": list(set(recover_imgs))}
+        # Deduplicate recovered images by filename
+        unique_recover = []
+        seen_names = set()
+        for img in recover_imgs:
+            if img["nombre_archivo"] not in seen_names:
+                unique_recover.append(img)
+                seen_names.add(img["nombre_archivo"])
+                
+        return {"db_context": valid_results, "recovered_images": unique_recover}
 
     @traceable(run_type="chain", name="histology_rag_generate_response")
     async def _node_generate_response(self, state: AgentState) -> AgentState:
@@ -261,13 +294,22 @@ class Neo4jHistologyAgent:
 
         ctx_db_str = "--- TEXTOS DEL MANUAL ---\n" + "\n\n".join(context_texts) + "\n\n--- IMÁGENES DE REFERENCIA EN DB ---\n" + "\n\n".join(context_images)
 
-        raw_prompt = load_prompt("rag_generation.txt")
-        prompt     = raw_prompt.format(
-            MEMORY=state.get("relevant_memory", "Sin contexto."),
-            DB_CONTEXT=ctx_db_str,
-            VISUAL_ANALYSIS=state.get("visual_analysis", "El usuario no subió ninguna imagen."),
-            INPUT=state["input"]
-        )
+        is_image_mode = bool(state.get("user_image"))
+        if is_image_mode:
+            raw_prompt = load_prompt("rag_generation_image.txt")
+            prompt     = raw_prompt.format(
+                MEMORY=state.get("relevant_memory", "Sin contexto."),
+                DB_CONTEXT=ctx_db_str,
+                VISUAL_ANALYSIS=state.get("visual_analysis", "El usuario no subió ninguna imagen."),
+                INPUT=state["input"]
+            )
+        else:
+            raw_prompt = load_prompt("rag_generation_text.txt")
+            prompt     = raw_prompt.format(
+                MEMORY=state.get("relevant_memory", "Sin contexto."),
+                DB_CONTEXT=ctx_db_str,
+                INPUT=state["input"]
+            )
 
         try:
             resp = await invoke_with_retry(self.llm, [SystemMessage(content="Eres un asistente RAG experto en histología."), HumanMessage(content=prompt)])
@@ -296,6 +338,15 @@ class Neo4jHistologyAgent:
             
             import time
             start_t = time.time()
+            
+            consulta_lower = text_query.lower()
+            palabras_clave_imagenes = [
+                "mostrar imagen", "mostrame imagen", "ver imagen", "quiero imagen",
+                "dame imagen", "buscar imagen", "imagen de", "imágenes de",
+                "foto de", "fotos de", "picture", "show image", "ver foto"
+            ]
+            solicita_imagenes = any(kw in consulta_lower for kw in palabras_clave_imagenes)
+            
             initial_state = {
                 "input": text_query,
                 "session_id": session_id,
@@ -308,7 +359,8 @@ class Neo4jHistologyAgent:
                 "output": "",
                 "trajectory": [],
                 "identified_structure": None,
-                "recovered_images": []
+                "recovered_images": [],
+                "solicita_imagenes": solicita_imagenes
             }
             final_state = await self.graph.ainvoke(initial_state)
             time_elapsed = round(time.time() - start_t, 2)
@@ -319,5 +371,6 @@ class Neo4jHistologyAgent:
                 "answer": final_state["output"],
                 "trajectory": trajectory,
                 "identified_structure": final_state.get("identified_structure"),
-                "recovered_images": final_state.get("recovered_images", [])
+                "recovered_images": final_state.get("recovered_images", []),
+                "mostrar_imagenes": final_state.get("solicita_imagenes", False)
             }

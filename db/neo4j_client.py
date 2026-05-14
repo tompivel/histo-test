@@ -382,12 +382,82 @@ class Neo4jClient:
             print(f"⚠️ Semantic Path search error: {e}")
             return []
 
+    async def busqueda_imagenes_semantica(self, texto_embedding: List[float],
+                                          entidades: Dict[str, List[str]],
+                                          embeddings_model,
+                                          top_k: int = 5) -> List[Dict]:
+        """Busca imágenes por similitud semántica de su texto/caption."""
+        import numpy as np
+        import os
+        
+        # Primero buscamos imágenes de las páginas de los chunks más relevantes
+        chunks_relevantes = await self.vector_search(texto_embedding, TEXT_INDEX_NAME, top_k=10)
+        candidatas = {}
+        for chunk in chunks_relevantes:
+            if chunk.get("similarity", 0) < 0.35: continue
+            fuente = chunk.get("source", "")
+            if not fuente: continue
+            
+            query_imgs = """
+                MATCH (i:Imagen {fuente: $fuente})
+                WHERE i.path IS NOT NULL
+                RETURN i.id AS id,
+                       CASE 
+                           WHEN i.caption IS NOT NULL AND i.caption <> '' THEN i.caption
+                           WHEN i.texto_pagina IS NOT NULL AND i.texto_pagina <> '' THEN i.texto_pagina
+                           ELSE coalesce(i.ocr_text, '')
+                       END AS text,
+                       i.fuente AS source,
+                       'imagen' AS type,
+                       i.path AS image_path,
+                       coalesce(i.nombre_archivo, '') AS nombre_archivo,
+                       coalesce(i.etiqueta, '') AS etiqueta
+                LIMIT 10
+            """
+            imgs = await self.run(query_imgs, {"fuente": fuente})
+            for img in imgs:
+                img_id = img.get("id")
+                if img_id and img_id not in candidatas:
+                    candidatas[img_id] = img
+                    
+        if not candidatas:
+            return []
+            
+        resultados_rankeados = []
+        q_emb = np.array(texto_embedding)
+        for img_id, img_dict in candidatas.items():
+            caption = img_dict.get("text", "")
+            if not caption or len(caption.strip()) < 10:
+                continue
+            try:
+                caption_emb = np.array(embeddings_model.embed_query(caption[:500]))
+                sim = float(q_emb @ caption_emb / (np.linalg.norm(q_emb) * np.linalg.norm(caption_emb) + 1e-10))
+                img_dict["similarity"] = sim
+                resultados_rankeados.append(img_dict)
+            except Exception as e:
+                continue
+                
+        resultados_rankeados.sort(key=lambda x: x["similarity"], reverse=True)
+        return [r for r in resultados_rankeados if r["similarity"] >= 0.45][:top_k]
+
     async def hybrid_search(self,
                                 text_embedding: Optional[List[float]],
                                 image_embedding_uni: Optional[List[float]],
                                 image_embedding_plip: Optional[List[float]],
                                 entities: Dict[str, List[str]],
                                 top_k: int = 10) -> List[Dict]:
+        is_image_mode = (image_embedding_uni is not None)
+        
+        # Strict mode-based thresholds
+        if is_image_mode:
+            text_thresh = 0.60
+            uni_thresh = 0.90
+            plip_thresh = 0.92
+        else:
+            text_thresh = 0.45
+            uni_thresh = 0.95
+            plip_thresh = 0.95
+
         res_text = []
         res_uni  = []
         res_plip = []
@@ -395,11 +465,14 @@ class Neo4jClient:
         res_vec  = []
 
         if text_embedding is not None:
-            res_text = await self.vector_search(text_embedding, TEXT_INDEX_NAME, top_k)
+            raw_text = await self.vector_search(text_embedding, TEXT_INDEX_NAME, top_k * 2)
+            res_text = [r for r in raw_text if r.get("similarity", 0) >= text_thresh][:top_k]
         if image_embedding_uni is not None:
-            res_uni = await self.vector_search(image_embedding_uni, UNI_INDEX_NAME, top_k)
+            raw_uni = await self.vector_search(image_embedding_uni, UNI_INDEX_NAME, top_k * 2)
+            res_uni = [r for r in raw_uni if r.get("similarity", 0) >= uni_thresh][:top_k]
         if image_embedding_plip is not None:
-            res_plip = await self.vector_search(image_embedding_plip, PLIP_INDEX_NAME, top_k)
+            raw_plip = await self.vector_search(image_embedding_plip, PLIP_INDEX_NAME, top_k * 2)
+            res_plip = [r for r in raw_plip if r.get("similarity", 0) >= plip_thresh][:top_k]
 
         res_ent = await self.entity_search(entities, top_k)
 
