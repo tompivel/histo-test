@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -1125,6 +1125,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/42/5b/4910551367de5c6ec246616fcc0ddb0bc6f9e5d353d4a22dcb5ab1f87e60/langchain_huggingface-1.2.1.tar.gz", hash = "sha256:33d52a30a56775380c6b4321b78136a410eb079132a80fe7120ddd4b954b4efa", size = 253106, upload-time = "2026-03-02T18:44:39.163Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/90/a1440bfa467a6dd9025ad80f3c239554de28aec49dacfb369fda92871556/langchain_huggingface-1.2.1-py3-none-any.whl", hash = "sha256:0930c216a457d2c8dc7b39a756c39c567f1d88593bfee2c3441f3ae718435f0f", size = 30924, upload-time = "2026-03-02T18:44:37.745Z" },
+]
+
+[[package]]
+name = "langchain-text-splitters"
+version = "1.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langchain-core" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/85/38/14121ead61e0e75f79c3a35e5148ac7c2fe754a55f76eab3eed573269524/langchain_text_splitters-1.1.1.tar.gz", hash = "sha256:34861abe7c07d9e49d4dc852d0129e26b32738b60a74486853ec9b6d6a8e01d2", size = 279352, upload-time = "2026-02-18T23:02:42.798Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/84/66/d9e0c3b83b0ad75ee746c51ba347cacecb8d656b96e1d513f3e334d1ccab/langchain_text_splitters-1.1.1-py3-none-any.whl", hash = "sha256:5ed0d7bf314ba925041e7d7d17cd8b10f688300d5415fb26c29442f061e329dc", size = 35734, upload-time = "2026-02-18T23:02:41.913Z" },
 ]
 
 [[package]]
@@ -2696,6 +2708,7 @@ dependencies = [
     { name = "langchain-google-genai" },
     { name = "langchain-groq" },
     { name = "langchain-huggingface" },
+    { name = "langchain-text-splitters" },
     { name = "langgraph" },
     { name = "langsmith" },
     { name = "neo4j" },
@@ -2725,6 +2738,7 @@ requires-dist = [
     { name = "langchain-google-genai", specifier = ">=2.0" },
     { name = "langchain-groq", specifier = ">=1.1.2" },
     { name = "langchain-huggingface", specifier = ">=0.1.0" },
+    { name = "langchain-text-splitters", specifier = ">=1.1.1" },
     { name = "langgraph", specifier = ">=0.2" },
     { name = "langsmith", specifier = ">=0.1" },
     { name = "neo4j", specifier = ">=5.0" },
